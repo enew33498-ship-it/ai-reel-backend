@@ -75,7 +75,16 @@ CUT VIDEO
 ==================================================
 */
 
-app.post("/cut", upload.single("video"), async (req, res) => {
+app.post(
+  "/cut",
+  (req, res, next) => {
+    console.log("=================================");
+    console.log("CUT ENDPOINT HIT");
+    console.log("=================================");
+    next();
+  },
+  upload.single("video"),
+  async (req, res) => {
   let inputPath = null;
   let outputPath = null;
 
