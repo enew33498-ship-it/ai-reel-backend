@@ -75,6 +75,16 @@ CUT VIDEO
 ==================================================
 */
 
+app.get("/cut", (req, res) => {
+  console.log("=================================");
+  console.log("CUT TEST URL OPENED");
+  console.log("=================================");
+
+  res.json({
+    status: "ok",
+    message: "CUT endpoint is reachable"
+  });
+});
 app.post(
   "/cut",
   (req, res, next) => {
