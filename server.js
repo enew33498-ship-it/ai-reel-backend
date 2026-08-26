@@ -53,6 +53,7 @@ app.get("/", (req, res) => {
     service: "AI Reel FFmpeg Backend",
     message: "Server is running",
     endpoint: "/cut",
+    mode: "stream-copy",
   });
 });
 
@@ -80,7 +81,7 @@ function cleanupFiles(inputPath, outputPath) {
     }
   } catch (error) {
     console.log(
-      "[CLEANUP] Input error:",
+      "[CLEANUP] Input delete error:",
       error.message
     );
   }
@@ -92,10 +93,69 @@ function cleanupFiles(inputPath, outputPath) {
     }
   } catch (error) {
     console.log(
-      "[CLEANUP] Output error:",
+      "[CLEANUP] Output delete error:",
       error.message
     );
   }
+}
+
+/*
+==================================================
+RUN FFMPEG
+==================================================
+*/
+
+function runFFmpeg(ffmpegPath, args) {
+  return new Promise((resolve, reject) => {
+    console.log("[FFMPEG] Starting...");
+
+    const ffmpeg = spawn(
+      ffmpegPath,
+      args
+    );
+
+    let stderr = "";
+
+    ffmpeg.stderr.on("data", (data) => {
+      const text = data.toString();
+
+      stderr += text;
+
+      console.log(
+        "[FFMPEG]",
+        text.trim()
+      );
+    });
+
+    ffmpeg.on("error", (error) => {
+      console.error(
+        "[FFMPEG] Process error:",
+        error
+      );
+
+      reject(error);
+    });
+
+    ffmpeg.on("close", (code) => {
+      console.log(
+        "[FFMPEG] Finished with code:",
+        code
+      );
+
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(
+          new Error(
+            "FFmpeg exited with code " +
+              code +
+              "\n" +
+              stderr.slice(-8000)
+          )
+        );
+      }
+    });
+  });
 }
 
 /*
@@ -113,33 +173,44 @@ app.post(
 
     try {
       console.log("");
-      console.log("=================================");
-      console.log("[CUT] REQUEST RECEIVED");
-      console.log("=================================");
+      console.log(
+        "================================="
+      );
+      console.log(
+        "[CUT] REQUEST RECEIVED"
+      );
+      console.log(
+        "================================="
+      );
 
       /*
       ------------------------------------------
-      CHECK FILE
+      FILE CHECK
       ------------------------------------------
       */
 
       if (!req.file) {
-        console.log("[CUT] ERROR: No video received");
+        console.log(
+          "[CUT] ERROR: No video received"
+        );
 
         return res.status(400).json({
-          error: "No video file received.",
+          error:
+            "No video file received.",
         });
       }
 
-      inputPath = req.file.path;
+      inputPath =
+        req.file.path;
 
       /*
       ------------------------------------------
-      START TIME
+      START
       ------------------------------------------
       */
 
-      let start = Number(req.body.start);
+      let start =
+        Number(req.body.start);
 
       if (!Number.isFinite(start)) {
         start = 0;
@@ -149,7 +220,49 @@ app.post(
         start = 0;
       }
 
-      start = Math.round(start * 100) / 100;
+      start =
+        Math.round(start * 1000) /
+        1000;
+
+      /*
+      ------------------------------------------
+      LENGTH
+      ------------------------------------------
+
+      We are NOT forcing exactly 30 seconds.
+
+      The client normally sends a 30-second
+      candidate window.
+
+      Stream copy may move the beginning to
+      a nearby keyframe.
+
+      ------------------------------------------
+      */
+
+      let duration =
+        Number(req.body.duration);
+
+      if (
+        !Number.isFinite(duration) ||
+        duration <= 0
+      ) {
+        duration = 30;
+      }
+
+      /*
+      Keep the requested clip around
+      30 seconds.
+      */
+
+      duration =
+        Math.max(
+          10,
+          Math.min(
+            60,
+            duration
+          )
+        );
 
       console.log(
         "[CUT] Original file:",
@@ -157,7 +270,7 @@ app.post(
       );
 
       console.log(
-        "[CUT] Uploaded size:",
+        "[CUT] Uploaded:",
         (
           req.file.size /
           1024 /
@@ -167,8 +280,14 @@ app.post(
       );
 
       console.log(
-        "[CUT] Start:",
+        "[CUT] Requested start:",
         start,
+        "seconds"
+      );
+
+      console.log(
+        "[CUT] Requested duration:",
+        duration,
         "seconds"
       );
 
@@ -180,8 +299,12 @@ app.post(
 
       outputPath = path.join(
         os.tmpdir(),
-        "AI_Reel_30s_" +
+        "AI_Reel_Copy_" +
           Date.now() +
+          "_" +
+          Math.random()
+            .toString(36)
+            .slice(2) +
           ".mp4"
       );
 
@@ -200,27 +323,29 @@ app.post(
 
       /*
       ==================================================
-      FFMPEG SETTINGS
-      ==================================================
+      STREAM COPY
 
-      30 seconds exactly
+      IMPORTANT:
 
-      H.264:
-      - good Android compatibility
-      - smooth MP4 playback
+      -c:v copy
+      -c:a copy
 
-      CRF:
-      - controls quality/file size
+      means FFmpeg does NOT re-encode the
+      video or audio.
 
-      maxrate/bufsize:
-      - prevents unnecessarily huge files
+      Therefore:
 
-      AAC:
-      - standard MP4 audio
+      ✔ Original video speed
+      ✔ Original FPS
+      ✔ Original quality
+      ✔ Original audio
+      ✔ Original audio timing
+      ✔ Much faster processing
+      ✔ Much smaller processing load
 
-      faststart:
-      - helps MP4 start playing properly
-
+      The cut can align to a nearby keyframe.
+      That is intentional because we want to
+      preserve the original video stream.
       ==================================================
       */
 
@@ -232,182 +357,77 @@ app.post(
         "-y",
 
         /*
-        Start position
+        Start position.
+
+        Placed before -i so FFmpeg can seek
+        quickly to the selected section.
         */
+
         "-ss",
         String(start),
 
-        /*
-        Input
-        */
         "-i",
         inputPath,
 
         /*
-        EXACTLY 30 SECONDS
+        Approximate clip length.
+
+        Exact frame-level 30.000 sec is NOT
+        required by this workflow.
         */
+
         "-t",
-        "30",
+        String(duration),
 
         /*
-        VIDEO
+        Copy original streams.
         */
+
         "-map",
         "0:v:0",
 
-        /*
-        AUDIO IF AVAILABLE
-        */
         "-map",
         "0:a:0?",
 
-        /*
-        H.264
-        */
         "-c:v",
-        "libx264",
+        "copy",
 
-        /*
-        Fast enough for Render
-        */
-        "-preset",
-        "veryfast",
-
-        /*
-        Quality
-        */
-        "-crf",
-        "21",
-
-        /*
-        Prevent huge output
-        */
-        "-maxrate",
-        "5M",
-
-        "-bufsize",
-        "10M",
-
-        /*
-        Pixel format supported
-        by most phones
-        */
-        "-pix_fmt",
-        "yuv420p",
-
-        /*
-        AUDIO
-        */
         "-c:a",
-        "aac",
-
-        "-b:a",
-        "128k",
+        "copy",
 
         /*
-        Audio sample rate
+        MP4 playback compatibility.
         */
-        "-ar",
-        "48000",
 
-        /*
-        MP4 compatibility
-        */
         "-movflags",
         "+faststart",
 
         /*
-        Clean timestamps
+        Make timestamps safer for MP4.
         */
+
         "-avoid_negative_ts",
         "make_zero",
 
-        /*
-        OUTPUT
-        */
         outputPath,
       ];
 
       console.log("");
       console.log(
-        "[FFMPEG] Starting encoding..."
+        "[CUT] Using STREAM COPY mode"
       );
 
       console.log(
-        "[FFMPEG] 30-second output"
+        "[CUT] No video re-encoding"
       );
 
-      /*
-      ------------------------------------------
-      RUN FFMPEG
-      ------------------------------------------
-      */
+      console.log(
+        "[CUT] No audio re-encoding"
+      );
 
-      await new Promise(
-        (resolve, reject) => {
-          const ffmpeg =
-            spawn(
-              ffmpegPath,
-              args
-            );
-
-          let stderr = "";
-
-          ffmpeg.stderr.on(
-            "data",
-            (data) => {
-              const text =
-                data.toString();
-
-              stderr += text;
-
-              /*
-              Show FFmpeg logs
-              in Render
-              */
-
-              console.log(
-                "[FFMPEG]",
-                text.trim()
-              );
-            }
-          );
-
-          ffmpeg.on(
-            "error",
-            (error) => {
-              console.error(
-                "[FFMPEG] PROCESS ERROR:",
-                error
-              );
-
-              reject(error);
-            }
-          );
-
-          ffmpeg.on(
-            "close",
-            (code) => {
-              console.log(
-                "[FFMPEG] Finished with code:",
-                code
-              );
-
-              if (code === 0) {
-                resolve();
-              } else {
-                reject(
-                  new Error(
-                    "FFmpeg exited with code " +
-                      code +
-                      "\n" +
-                      stderr.slice(-8000)
-                  )
-                );
-              }
-            }
-          );
-        }
+      await runFFmpeg(
+        ffmpegPath,
+        args
       );
 
       /*
@@ -446,7 +466,7 @@ app.post(
       );
 
       console.log(
-        "[SUCCESS] Size:",
+        "[SUCCESS] Output size:",
         (
           stats.size /
           1024 /
@@ -461,7 +481,7 @@ app.post(
 
       /*
       ------------------------------------------
-      SEND MP4
+      RESPONSE HEADERS
       ------------------------------------------
       */
 
@@ -474,7 +494,7 @@ app.post(
 
       res.setHeader(
         "Content-Disposition",
-        'attachment; filename="AI_Reel_Best_30_Seconds.mp4"'
+        'attachment; filename="AI_Reel_Best_Moment.mp4"'
       );
 
       res.setHeader(
@@ -484,7 +504,7 @@ app.post(
 
       /*
       ------------------------------------------
-      STREAM OUTPUT
+      STREAM MP4 TO CLIENT
       ------------------------------------------
       */
 
@@ -493,43 +513,34 @@ app.post(
           outputPath
         );
 
-      stream.on(
-        "error",
-        (error) => {
-          console.error(
-            "[STREAM] ERROR:",
-            error
-          );
+      stream.on("error", (error) => {
+        console.error(
+          "[STREAM] Error:",
+          error
+        );
 
-          cleanupFiles(
-            inputPath,
-            outputPath
-          );
-        }
-      );
+        cleanupFiles(
+          inputPath,
+          outputPath
+        );
+      });
 
-      stream.on(
-        "end",
-        () => {
-          console.log(
-            "[STREAM] MP4 SENT COMPLETELY"
-          );
-        }
-      );
+      stream.on("end", () => {
+        console.log(
+          "[STREAM] MP4 sent completely"
+        );
+      });
 
-      stream.on(
-        "close",
-        () => {
-          console.log(
-            "[STREAM] Connection closed"
-          );
+      stream.on("close", () => {
+        console.log(
+          "[STREAM] Stream closed"
+        );
 
-          cleanupFiles(
-            inputPath,
-            outputPath
-          );
-        }
-      );
+        cleanupFiles(
+          inputPath,
+          outputPath
+        );
+      });
 
       stream.pipe(res);
 
@@ -570,7 +581,7 @@ app.post(
 
 /*
 ==================================================
-MULTER / SERVER ERROR HANDLER
+GENERAL ERROR HANDLER
 ==================================================
 */
 
@@ -583,7 +594,8 @@ app.use(
 
     if (!res.headersSent) {
       res.status(500).json({
-        error: "Server error",
+        error:
+          "Server error",
         details:
           err.message,
       });
@@ -620,11 +632,11 @@ app.listen(
     );
 
     console.log(
-      "30-second MP4 mode enabled"
+      "STREAM COPY MODE enabled"
     );
 
     console.log(
-      "H.264 + AAC + faststart"
+      "Original speed / FPS / audio preserved"
     );
 
     console.log(
