@@ -68,16 +68,6 @@ function getFFmpegPath() {
 
 /*
 ==================================================
-TIME
-==================================================
-*/
-
-function now() {
-  return new Date().toISOString();
-}
-
-/*
-==================================================
 CLEANUP
 ==================================================
 */
@@ -86,11 +76,11 @@ function cleanupFiles(inputPath, outputPath) {
   try {
     if (inputPath && fs.existsSync(inputPath)) {
       fs.unlinkSync(inputPath);
-      console.log("[CLEANUP] Input deleted:", inputPath);
+      console.log("[CLEANUP] Input deleted");
     }
   } catch (error) {
     console.log(
-      "[CLEANUP] Input delete error:",
+      "[CLEANUP] Input error:",
       error.message
     );
   }
@@ -98,11 +88,11 @@ function cleanupFiles(inputPath, outputPath) {
   try {
     if (outputPath && fs.existsSync(outputPath)) {
       fs.unlinkSync(outputPath);
-      console.log("[CLEANUP] Output deleted:", outputPath);
+      console.log("[CLEANUP] Output deleted");
     }
   } catch (error) {
     console.log(
-      "[CLEANUP] Output delete error:",
+      "[CLEANUP] Output error:",
       error.message
     );
   }
@@ -116,98 +106,25 @@ CUT VIDEO
 
 app.post(
   "/cut",
-  (req, res, next) => {
-
-    console.log("");
-    console.log("==========================================");
-    console.log("[CUT] POST /cut RECEIVED");
-    console.log("[CUT] Time:", now());
-    console.log("==========================================");
-
-    /*
-    Detect if browser/mobile connection disappears
-    while uploading or processing.
-    */
-
-    req.on("aborted", () => {
-      console.log(
-        "[REQUEST] CLIENT ABORTED REQUEST"
-      );
-    });
-
-    req.on("close", () => {
-      console.log(
-        "[REQUEST] Request stream closed"
-      );
-    });
-
-    next();
-  },
-
   upload.single("video"),
-
   async (req, res) => {
-
     let inputPath = null;
     let outputPath = null;
-    let ffmpegProcess = null;
-    let responseStarted = false;
-    let cleaned = false;
-
-    const cleanup = () => {
-      if (cleaned) return;
-
-      cleaned = true;
-
-      cleanupFiles(
-        inputPath,
-        outputPath
-      );
-    };
-
-    /*
-    ==============================================
-    RESPONSE CONNECTION EVENTS
-    ==============================================
-    */
-
-    res.on("close", () => {
-      console.log(
-        "[RESPONSE] Response connection CLOSED"
-      );
-
-      if (!responseStarted) {
-        console.log(
-          "[RESPONSE] Connection closed BEFORE response started"
-        );
-      }
-    });
-
-    res.on("finish", () => {
-      console.log(
-        "[RESPONSE] Response FINISHED successfully"
-      );
-
-      cleanup();
-    });
 
     try {
+      console.log("");
+      console.log("=================================");
+      console.log("[CUT] REQUEST RECEIVED");
+      console.log("=================================");
 
       /*
-      ============================================
-      MULTER / UPLOAD COMPLETE
-      ============================================
+      ------------------------------------------
+      CHECK FILE
+      ------------------------------------------
       */
 
-      console.log(
-        "[UPLOAD] Multer processing finished"
-      );
-
       if (!req.file) {
-
-        console.log(
-          "[ERROR] No video received"
-        );
+        console.log("[CUT] ERROR: No video received");
 
         return res.status(400).json({
           error: "No video file received.",
@@ -216,28 +133,31 @@ app.post(
 
       inputPath = req.file.path;
 
-      let start = Number(
-        req.body.start
-      );
+      /*
+      ------------------------------------------
+      START TIME
+      ------------------------------------------
+      */
+
+      let start = Number(req.body.start);
 
       if (!Number.isFinite(start)) {
         start = 0;
       }
 
-      start = Math.max(0, start);
+      if (start < 0) {
+        start = 0;
+      }
+
+      start = Math.round(start * 100) / 100;
 
       console.log(
-        "[UPLOAD] Original filename:",
+        "[CUT] Original file:",
         req.file.originalname
       );
 
       console.log(
-        "[UPLOAD] MIME:",
-        req.file.mimetype
-      );
-
-      console.log(
-        "[UPLOAD] Uploaded size:",
+        "[CUT] Uploaded size:",
         (
           req.file.size /
           1024 /
@@ -247,52 +167,21 @@ app.post(
       );
 
       console.log(
-        "[UPLOAD] Temporary input:",
-        inputPath
-      );
-
-      console.log(
-        "[CUT] Requested start:",
+        "[CUT] Start:",
         start,
         "seconds"
       );
 
       /*
-      ============================================
-      CHECK INPUT
-      ============================================
-      */
-
-      if (!fs.existsSync(inputPath)) {
-
-        throw new Error(
-          "Uploaded temporary file does not exist."
-        );
-      }
-
-      const inputStats =
-        fs.statSync(inputPath);
-
-      console.log(
-        "[INPUT] File exists:",
-        inputStats.size,
-        "bytes"
-      );
-
-      /*
-      ============================================
+      ------------------------------------------
       OUTPUT
-      ============================================
+      ------------------------------------------
       */
 
       outputPath = path.join(
         os.tmpdir(),
-        "AI_Reel_" +
+        "AI_Reel_30s_" +
           Date.now() +
-          "_" +
-          Math.random()
-            .toString(36)
-            .slice(2) +
           ".mp4"
       );
 
@@ -300,127 +189,163 @@ app.post(
         getFFmpegPath();
 
       console.log(
-        "[FFMPEG] Path:",
+        "[CUT] FFmpeg:",
         ffmpegPath
       );
 
       console.log(
-        "[FFMPEG] Output:",
+        "[CUT] Output:",
         outputPath
       );
 
       /*
-      ============================================
-      FFMPEG
-      ============================================
+      ==================================================
+      FFMPEG SETTINGS
+      ==================================================
 
-      -ss BEFORE -i
-      ----------------
-      Fast seeking.
+      30 seconds exactly
 
-      -t 30
-      ----------------
-      Exact 30-second duration.
+      H.264:
+      - good Android compatibility
+      - smooth MP4 playback
 
-      ultrafast
-      ----------------
-      Faster processing on Render.
+      CRF:
+      - controls quality/file size
 
-      crf 23
-      ----------------
-      Good quality while reducing CPU/time.
+      maxrate/bufsize:
+      - prevents unnecessarily huge files
 
-      ============================================
+      AAC:
+      - standard MP4 audio
+
+      faststart:
+      - helps MP4 start playing properly
+
+      ==================================================
       */
 
       const args = [
-
         "-hide_banner",
-
         "-loglevel",
-        "warning",
+        "info",
 
         "-y",
 
+        /*
+        Start position
+        */
         "-ss",
         String(start),
 
+        /*
+        Input
+        */
         "-i",
         inputPath,
 
+        /*
+        EXACTLY 30 SECONDS
+        */
         "-t",
         "30",
 
+        /*
+        VIDEO
+        */
         "-map",
         "0:v:0",
 
+        /*
+        AUDIO IF AVAILABLE
+        */
         "-map",
         "0:a:0?",
 
+        /*
+        H.264
+        */
         "-c:v",
         "libx264",
 
+        /*
+        Fast enough for Render
+        */
         "-preset",
-        "ultrafast",
+        "veryfast",
 
+        /*
+        Quality
+        */
         "-crf",
-        "23",
+        "21",
 
+        /*
+        Prevent huge output
+        */
+        "-maxrate",
+        "5M",
+
+        "-bufsize",
+        "10M",
+
+        /*
+        Pixel format supported
+        by most phones
+        */
+        "-pix_fmt",
+        "yuv420p",
+
+        /*
+        AUDIO
+        */
         "-c:a",
         "aac",
 
         "-b:a",
         "128k",
 
+        /*
+        Audio sample rate
+        */
+        "-ar",
+        "48000",
+
+        /*
+        MP4 compatibility
+        */
         "-movflags",
         "+faststart",
 
+        /*
+        Clean timestamps
+        */
         "-avoid_negative_ts",
         "make_zero",
 
+        /*
+        OUTPUT
+        */
         outputPath,
       ];
 
       console.log("");
       console.log(
-        "[FFMPEG] =================================="
+        "[FFMPEG] Starting encoding..."
       );
 
       console.log(
-        "[FFMPEG] STARTING"
+        "[FFMPEG] 30-second output"
       );
-
-      console.log(
-        "[FFMPEG] Start:",
-        start,
-        "seconds"
-      );
-
-      console.log(
-        "[FFMPEG] Duration: 30 seconds"
-      );
-
-      console.log(
-        "[FFMPEG] Preset: ultrafast"
-      );
-
-      console.log(
-        "[FFMPEG] =================================="
-      );
-
-      const ffmpegStartTime =
-        Date.now();
 
       /*
-      ============================================
-      START FFMPEG
-      ============================================
+      ------------------------------------------
+      RUN FFMPEG
+      ------------------------------------------
       */
 
       await new Promise(
         (resolve, reject) => {
-
-          ffmpegProcess =
+          const ffmpeg =
             spawn(
               ffmpegPath,
               args
@@ -428,136 +353,73 @@ app.post(
 
           let stderr = "";
 
-          ffmpegProcess.stderr.on(
+          ffmpeg.stderr.on(
             "data",
             (data) => {
-
               const text =
                 data.toString();
 
               stderr += text;
 
-              const clean =
-                text.trim();
+              /*
+              Show FFmpeg logs
+              in Render
+              */
 
-              if (clean) {
-                console.log(
-                  "[FFMPEG]",
-                  clean
-                );
-              }
-
+              console.log(
+                "[FFMPEG]",
+                text.trim()
+              );
             }
           );
 
-          ffmpegProcess.stdout.on(
-            "data",
-            (data) => {
-
-              const text =
-                data.toString().trim();
-
-              if (text) {
-                console.log(
-                  "[FFMPEG-OUT]",
-                  text
-                );
-              }
-
-            }
-          );
-
-          ffmpegProcess.on(
+          ffmpeg.on(
             "error",
             (error) => {
-
               console.error(
                 "[FFMPEG] PROCESS ERROR:",
                 error
               );
 
               reject(error);
-
             }
           );
 
-          ffmpegProcess.on(
+          ffmpeg.on(
             "close",
-            (code, signal) => {
-
-              const seconds =
-                (
-                  (Date.now() -
-                    ffmpegStartTime) /
-                  1000
-                ).toFixed(1);
-
+            (code) => {
               console.log(
-                "[FFMPEG] FINISHED"
-              );
-
-              console.log(
-                "[FFMPEG] Exit code:",
+                "[FFMPEG] Finished with code:",
                 code
               );
 
-              console.log(
-                "[FFMPEG] Signal:",
-                signal || "none"
-              );
-
-              console.log(
-                "[FFMPEG] Processing time:",
-                seconds,
-                "seconds"
-              );
-
               if (code === 0) {
-
                 resolve();
-
               } else {
-
                 reject(
                   new Error(
-                    "FFmpeg failed. Exit code: " +
+                    "FFmpeg exited with code " +
                       code +
-                      " Signal: " +
-                      (
-                        signal ||
-                        "none"
-                      ) +
                       "\n" +
                       stderr.slice(-8000)
                   )
                 );
-
               }
-
             }
           );
-
         }
       );
 
-      ffmpegProcess = null;
-
       /*
-      ============================================
-      OUTPUT CHECK
-      ============================================
+      ------------------------------------------
+      CHECK OUTPUT
+      ------------------------------------------
       */
 
-      console.log(
-        "[OUTPUT] Checking MP4..."
-      );
-
       if (
-        !fs.existsSync(
-          outputPath
-        )
+        !outputPath ||
+        !fs.existsSync(outputPath)
       ) {
-
         throw new Error(
           "FFmpeg finished but MP4 was not created."
         );
@@ -568,12 +430,23 @@ app.post(
           outputPath
         );
 
+      if (stats.size <= 0) {
+        throw new Error(
+          "Output MP4 is empty."
+        );
+      }
+
+      console.log("");
       console.log(
-        "[OUTPUT] MP4 exists"
+        "================================="
       );
 
       console.log(
-        "[OUTPUT] Size:",
+        "[SUCCESS] MP4 CREATED"
+      );
+
+      console.log(
+        "[SUCCESS] Size:",
         (
           stats.size /
           1024 /
@@ -582,24 +455,17 @@ app.post(
         "MB"
       );
 
-      if (stats.size <= 0) {
-
-        throw new Error(
-          "Output MP4 is empty."
-        );
-      }
-
-      /*
-      ============================================
-      SEND RESPONSE
-      ============================================
-      */
-
       console.log(
-        "[RESPONSE] Preparing MP4 response..."
+        "================================="
       );
 
-      res.statusCode = 200;
+      /*
+      ------------------------------------------
+      SEND MP4
+      ------------------------------------------
+      */
+
+      res.status(200);
 
       res.setHeader(
         "Content-Type",
@@ -617,22 +483,10 @@ app.post(
       );
 
       /*
-      Flush headers immediately so browser knows
-      response has started.
+      ------------------------------------------
+      STREAM OUTPUT
+      ------------------------------------------
       */
-
-      if (
-        typeof res.flushHeaders ===
-        "function"
-      ) {
-        res.flushHeaders();
-      }
-
-      responseStarted = true;
-
-      console.log(
-        "[RESPONSE] Sending MP4 to client..."
-      );
 
       const stream =
         fs.createReadStream(
@@ -642,121 +496,75 @@ app.post(
       stream.on(
         "error",
         (error) => {
-
           console.error(
             "[STREAM] ERROR:",
             error
           );
 
-          cleanup();
-
-          if (!res.headersSent) {
-
-            res.status(500).json({
-              error:
-                "Could not send video.",
-              details:
-                error.message,
-            });
-
-          } else {
-
-            res.destroy(
-              error
-            );
-
-          }
-
-        }
-      );
-
-      stream.on(
-        "open",
-        () => {
-
-          console.log(
-            "[STREAM] MP4 file stream OPEN"
+          cleanupFiles(
+            inputPath,
+            outputPath
           );
-
         }
       );
 
       stream.on(
         "end",
         () => {
-
           console.log(
-            "[STREAM] MP4 stream END"
+            "[STREAM] MP4 SENT COMPLETELY"
+          );
+        }
+      );
+
+      stream.on(
+        "close",
+        () => {
+          console.log(
+            "[STREAM] Connection closed"
           );
 
+          cleanupFiles(
+            inputPath,
+            outputPath
+          );
         }
       );
 
       stream.pipe(res);
 
     } catch (error) {
-
       console.error("");
       console.error(
-        "=========================================="
+        "================================="
       );
 
       console.error(
-        "[ERROR] VIDEO CREATION FAILED"
+        "[CUT] VIDEO CREATION ERROR"
       );
 
       console.error(
-        "[ERROR]",
-        error.message
+        error
       );
 
       console.error(
-        "=========================================="
+        "================================="
       );
 
-      /*
-      Kill FFmpeg if something failed while it
-      was still running.
-      */
-
-      if (ffmpegProcess) {
-
-        try {
-
-          console.log(
-            "[FFMPEG] Killing running process..."
-          );
-
-          ffmpegProcess.kill(
-            "SIGKILL"
-          );
-
-        } catch (killError) {
-
-          console.log(
-            "[FFMPEG] Kill error:",
-            killError.message
-          );
-
-        }
-
-      }
-
-      cleanup();
+      cleanupFiles(
+        inputPath,
+        outputPath
+      );
 
       if (!res.headersSent) {
-
         res.status(500).json({
           error:
             "Video creation failed.",
           details:
             error.message,
         });
-
       }
-
     }
-
   }
 );
 
@@ -768,54 +576,18 @@ MULTER / SERVER ERROR HANDLER
 
 app.use(
   (err, req, res, next) => {
-
-    console.error("");
     console.error(
-      "=========================================="
-    );
-
-    console.error(
-      "[SERVER ERROR]"
-    );
-
-    console.error(
+      "[SERVER ERROR]",
       err
     );
 
-    console.error(
-      "=========================================="
-    );
-
-    if (
-      err instanceof multer.MulterError
-    ) {
-
-      if (!res.headersSent) {
-
-        return res.status(400).json({
-          error:
-            "Upload error",
-          details:
-            err.message,
-          code:
-            err.code,
-        });
-
-      }
-
-    }
-
     if (!res.headersSent) {
-
       res.status(500).json({
-        error:
-          "Server error",
+        error: "Server error",
         details:
           err.message,
       });
-
     }
-
   }
 );
 
@@ -829,10 +601,9 @@ app.listen(
   PORT,
   "0.0.0.0",
   () => {
-
     console.log("");
     console.log(
-      "=========================================="
+      "================================="
     );
 
     console.log(
@@ -849,12 +620,15 @@ app.listen(
     );
 
     console.log(
-      "Detailed upload + FFmpeg logging enabled"
+      "30-second MP4 mode enabled"
     );
 
     console.log(
-      "=========================================="
+      "H.264 + AAC + faststart"
     );
 
+    console.log(
+      "================================="
+    );
   }
 );
