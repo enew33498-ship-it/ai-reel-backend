@@ -10,11 +10,9 @@ const app = express();
 
 const PORT = process.env.PORT || 10000;
 
-/*
-==================================================
+/* ==================================================
 CORS
-==================================================
-*/
+================================================== */
 
 app.use(
   cors({
@@ -24,63 +22,47 @@ app.use(
   })
 );
 
-/*
-==================================================
-BODY
-==================================================
-*/
-
 app.use(express.json());
 
-/*
-==================================================
+/* ==================================================
 UPLOAD
-==================================================
-*/
+================================================== */
 
 const upload = multer({
   dest: os.tmpdir(),
-
   limits: {
     fileSize: 5 * 1024 * 1024 * 1024,
   },
 });
 
-/*
-==================================================
-HEALTH CHECK
-==================================================
-*/
+/* ==================================================
+HEALTH
+================================================== */
 
 app.get("/", (req, res) => {
-  console.log("[HEALTH] GET /");
-
   res.status(200).json({
     status: "ok",
     service: "AI Reel FFmpeg Backend",
-    message: "Server is running",
     endpoint: "/cut",
     format: "9:16",
+    resolution: "1080x1920",
+    quality: "high",
     speed: "original",
     audio: "original",
   });
 });
 
-/*
-==================================================
-FFMPEG PATH
-==================================================
-*/
+/* ==================================================
+FFMPEG
+================================================== */
 
 function getFFmpegPath() {
   return process.env.FFMPEG_PATH || "ffmpeg";
 }
 
-/*
-==================================================
-NUMBER HELPER
-==================================================
-*/
+/* ==================================================
+NUMBER
+================================================== */
 
 function safeNumber(value, fallback) {
   const number = Number(value);
@@ -92,51 +74,23 @@ function safeNumber(value, fallback) {
   return number;
 }
 
-/*
-==================================================
+/* ==================================================
 CLEANUP
-==================================================
-*/
+================================================== */
 
-function cleanupFiles(inputPath, outputPath) {
+function cleanup(file) {
   try {
-    if (inputPath && fs.existsSync(inputPath)) {
-      fs.unlinkSync(inputPath);
-
-      console.log(
-        "[CLEANUP] Deleted input:",
-        inputPath
-      );
+    if (file && fs.existsSync(file)) {
+      fs.unlinkSync(file);
     }
   } catch (error) {
-    console.log(
-      "[CLEANUP] Input error:",
-      error.message
-    );
-  }
-
-  try {
-    if (outputPath && fs.existsSync(outputPath)) {
-      fs.unlinkSync(outputPath);
-
-      console.log(
-        "[CLEANUP] Deleted output:",
-        outputPath
-      );
-    }
-  } catch (error) {
-    console.log(
-      "[CLEANUP] Output error:",
-      error.message
-    );
+    console.log("[CLEANUP]", error.message);
   }
 }
 
-/*
-==================================================
-CUT + 9:16 CONVERT
-==================================================
-*/
+/* ==================================================
+CUT
+================================================== */
 
 app.post(
   "/cut",
@@ -147,27 +101,15 @@ app.post(
 
     try {
       console.log("");
-      console.log(
-        "=========================================="
-      );
-      console.log(
-        "[CUT] NEW VIDEO REQUEST"
-      );
-      console.log(
-        "=========================================="
-      );
+      console.log("==========================================");
+      console.log("AI REEL — NEW REQUEST");
+      console.log("==========================================");
 
-      /*
-      ------------------------------------------
-      CHECK FILE
-      ------------------------------------------
-      */
+      /* ------------------------------------------
+      FILE
+      ------------------------------------------ */
 
       if (!req.file) {
-        console.log(
-          "[CUT] ERROR: No video received"
-        );
-
         return res.status(400).json({
           error: "No video file received.",
         });
@@ -175,11 +117,9 @@ app.post(
 
       inputPath = req.file.path;
 
-      /*
-      ------------------------------------------
+      /* ------------------------------------------
       START
-      ------------------------------------------
-      */
+      ------------------------------------------ */
 
       let start = safeNumber(
         req.body.start,
@@ -190,11 +130,9 @@ app.post(
         start = 0;
       }
 
-      /*
-      ------------------------------------------
+      /* ------------------------------------------
       DURATION
-      ------------------------------------------
-      */
+      ------------------------------------------ */
 
       let duration = safeNumber(
         req.body.duration,
@@ -208,42 +146,25 @@ app.post(
         );
       }
 
-      /*
-      ------------------------------------------
-      SAFETY LIMIT
-      ------------------------------------------
-      */
+      duration = Math.max(
+        1,
+        Math.min(600, duration)
+      );
 
-      if (duration < 1) {
-        duration = 1;
-      }
+      duration =
+        Math.round(duration * 1000) / 1000;
 
-      if (duration > 600) {
-        duration = 600;
-      }
-
-      duration = Math.round(
-        duration * 1000
-      ) / 1000;
-
-      /*
-      ------------------------------------------
+      /* ------------------------------------------
       LOG
-      ------------------------------------------
-      */
+      ------------------------------------------ */
 
       console.log(
-        "[CUT] Original file:",
+        "[INPUT]",
         req.file.originalname
       );
 
       console.log(
-        "[CUT] Input:",
-        inputPath
-      );
-
-      console.log(
-        "[CUT] File size:",
+        "[SIZE]",
         (
           req.file.size /
           1024 /
@@ -253,42 +174,42 @@ app.post(
       );
 
       console.log(
-        "[CUT] Start:",
-        start,
-        "seconds"
+        "[START]",
+        start
       );
 
       console.log(
-        "[CUT] Duration:",
-        duration,
-        "seconds"
+        "[DURATION]",
+        duration
       );
 
       console.log(
-        "[CUT] Output ratio: 9:16"
+        "[FORMAT] 9:16"
       );
 
       console.log(
-        "[CUT] Output resolution: 1080x1920"
+        "[RESOLUTION] 1080x1920"
       );
 
       console.log(
-        "[CUT] Speed: ORIGINAL"
+        "[QUALITY] HIGH"
       );
 
       console.log(
-        "[CUT] Audio: ORIGINAL"
+        "[SPEED] ORIGINAL"
       );
 
-      /*
-      ==========================================
+      console.log(
+        "[AUDIO] ORIGINAL"
+      );
+
+      /* ------------------------------------------
       OUTPUT
-      ==========================================
-      */
+      ------------------------------------------ */
 
       outputPath = path.join(
         os.tmpdir(),
-        "AI_Reel_9x16_" +
+        "AI_REEL_" +
           Date.now() +
           "_" +
           Math.random()
@@ -297,70 +218,29 @@ app.post(
           ".mp4"
       );
 
-      const ffmpegPath =
-        getFFmpegPath();
+      /* ------------------------------------------
+      9:16 FILTER
+      ------------------------------------------
 
-      console.log(
-        "[CUT] FFmpeg:",
-        ffmpegPath
-      );
+      Video ko 1080x1920 ke liye scale karega.
 
-      console.log(
-        "[CUT] Output:",
-        outputPath
-      );
+      Aspect ratio preserve hoga.
 
-      /*
-      ==========================================
-      FFMPEG
-      ==========================================
+      Extra area center se crop hoga.
 
-      IMPORTANT:
-
-      -ss
-        Selected starting point
-
-      -i
-        Original video
-
-      -t
-        Selected duration
-
-      scale
-        Makes video large enough for 9:16
-
-      crop
-        Crops center into exact 9:16
-
-      1080x1920
-        Shorts/Reels resolution
-
-      setsar=1
-        Correct pixel aspect ratio
-
-      IMPORTANT:
-      No setpts.
-      No atempo.
-      No speed modification.
-
-      Therefore:
-      ORIGINAL SPEED.
-
-      Audio is copied through AAC encoding
-      without changing playback speed.
-      ==========================================
-      */
+      ------------------------------------------ */
 
       const filter =
-
-        "scale=" +
-        "1080:1920:" +
+        "scale=1080:1920:" +
         "force_original_aspect_ratio=increase," +
-
-        "crop=" +
-        "1080:1920," +
-
+        "crop=1080:1920:" +
+        "(iw-1080)/2:" +
+        "(ih-1920)/2," +
         "setsar=1";
+
+      /* ------------------------------------------
+      FFMPEG
+      ------------------------------------------ */
 
       const args = [
         "-hide_banner",
@@ -370,242 +250,143 @@ app.post(
 
         "-y",
 
-        /*
-        ----------------------------------------
-        SEEK
-        ----------------------------------------
-        */
-
+        /* Accurate starting point */
         "-ss",
         String(start),
 
-        /*
-        ----------------------------------------
-        INPUT
-        ----------------------------------------
-        */
-
+        /* Input */
         "-i",
         inputPath,
 
-        /*
-        ----------------------------------------
-        EXACT CLIP DURATION
-        ----------------------------------------
-        */
-
+        /* Exact selected duration */
         "-t",
         String(duration),
 
-        /*
-        ----------------------------------------
-        VIDEO FILTER
-        ----------------------------------------
-        */
-
+        /* 9:16 */
         "-vf",
         filter,
 
-        /*
-        ----------------------------------------
-        VIDEO
-        ----------------------------------------
-        */
-
+        /* Video */
         "-map",
         "0:v:0",
 
-        /*
-        ----------------------------------------
-        AUDIO
-        ----------------------------------------
-        */
-
+        /* Audio if available */
         "-map",
         "0:a:0?",
 
-        /*
-        ----------------------------------------
-        VIDEO ENCODING
-        ----------------------------------------
-        */
-
+        /* HIGH QUALITY H264 */
         "-c:v",
         "libx264",
 
-        "-preset",
-        "veryfast",
-
-        "-crf",
-        "20",
-
         /*
-        ----------------------------------------
-        PIXEL FORMAT
-        ----------------------------------------
+        Medium preset = better quality
+        than veryfast at same CRF
         */
 
+        "-preset",
+        "medium",
+
+        /*
+        Lower CRF = higher quality
+        */
+
+        "-crf",
+        "18",
+
+        /* H264 compatibility */
+        "-profile:v",
+        "high",
+
+        "-level",
+        "4.1",
+
+        /* Full quality color format */
         "-pix_fmt",
         "yuv420p",
 
-        /*
-        ----------------------------------------
-        AUDIO
-        ----------------------------------------
-        */
-
+        /* Audio */
         "-c:a",
         "aac",
 
         "-b:a",
         "192k",
 
-        /*
-        ----------------------------------------
-        MP4
-        ----------------------------------------
-        */
+        "-ar",
+        "48000",
 
+        /* Keep normal playback speed */
+        "-vsync",
+        "cfr",
+
+        /* MP4 optimization */
         "-movflags",
         "+faststart",
-
-        /*
-        ----------------------------------------
-        TIMESTAMP SAFETY
-        ----------------------------------------
-        */
 
         "-avoid_negative_ts",
         "make_zero",
 
-        /*
-        ----------------------------------------
-        OUTPUT
-        ----------------------------------------
-        */
-
+        /* Output */
         outputPath,
       ];
 
       console.log("");
+      console.log("[FFMPEG] STARTING");
       console.log(
-        "[FFMPEG] Starting..."
-      );
-
-      console.log(
-        "[FFMPEG] Command:"
-      );
-
-      console.log(
-        ffmpegPath +
+        getFFmpegPath() +
           " " +
           args.join(" ")
       );
 
-      console.log("");
-
-      /*
-      ==========================================
+      /* ------------------------------------------
       RUN FFMPEG
-      ==========================================
-      */
+      ------------------------------------------ */
 
       await new Promise(
         (resolve, reject) => {
-          const ffmpeg =
-            spawn(
-              ffmpegPath,
-              args
-            );
+          const ffmpeg = spawn(
+            getFFmpegPath(),
+            args
+          );
 
           let stderr = "";
 
-          let stdout = "";
-
-          /*
-          --------------------------------------
-          STDERR
-          --------------------------------------
-          */
-
           ffmpeg.stderr.on(
             "data",
-            (data) => {
+            data => {
               const text =
                 data.toString();
 
               stderr += text;
 
-              /*
-              Render logs
-              */
-
               process.stdout.write(
-                "[FFMPEG] " +
-                  text
+                "[FFMPEG] " + text
               );
             }
           );
-
-          /*
-          --------------------------------------
-          STDOUT
-          --------------------------------------
-          */
 
           ffmpeg.stdout.on(
             "data",
-            (data) => {
-              const text =
-                data.toString();
-
-              stdout += text;
-
+            data => {
               process.stdout.write(
                 "[FFMPEG-OUT] " +
-                  text
+                  data.toString()
               );
             }
           );
 
-          /*
-          --------------------------------------
-          PROCESS ERROR
-          --------------------------------------
-          */
-
           ffmpeg.on(
             "error",
-            (error) => {
-              console.error(
-                "[FFMPEG] PROCESS ERROR:"
-              );
-
-              console.error(
-                error
-              );
-
+            error => {
               reject(error);
             }
           );
 
-          /*
-          --------------------------------------
-          PROCESS FINISHED
-          --------------------------------------
-          */
-
           ffmpeg.on(
             "close",
-            (code) => {
+            code => {
               console.log("");
-
               console.log(
-                "[FFMPEG] Finished."
-              );
-
-              console.log(
-                "[FFMPEG] Exit code:",
+                "[FFMPEG] EXIT:",
                 code
               );
 
@@ -614,10 +395,10 @@ app.post(
               } else {
                 reject(
                   new Error(
-                    "FFmpeg exited with code " +
+                    "FFmpeg failed with code " +
                       code +
                       "\n" +
-                      stderr.slice(-8000)
+                      stderr.slice(-10000)
                   )
                 );
               }
@@ -626,11 +407,9 @@ app.post(
         }
       );
 
-      /*
-      ==========================================
+      /* ------------------------------------------
       CHECK OUTPUT
-      ==========================================
-      */
+      ------------------------------------------ */
 
       if (
         !outputPath ||
@@ -642,25 +421,21 @@ app.post(
       }
 
       const stats =
-        fs.statSync(
-          outputPath
-        );
+        fs.statSync(outputPath);
 
-      if (
-        !stats.size ||
-        stats.size <= 0
-      ) {
+      if (stats.size <= 0) {
         throw new Error(
-          "Output MP4 is empty."
+          "Generated MP4 is empty."
         );
       }
 
+      console.log("");
       console.log(
-        "[CUT] MP4 CREATED:"
+        "[SUCCESS] MP4 CREATED"
       );
 
       console.log(
-        "[CUT] Size:",
+        "[OUTPUT SIZE]",
         (
           stats.size /
           1024 /
@@ -669,11 +444,9 @@ app.post(
         "MB"
       );
 
-      /*
-      ==========================================
-      SEND MP4
-      ==========================================
-      */
+      /* ------------------------------------------
+      RESPONSE
+      ------------------------------------------ */
 
       res.status(200);
 
@@ -684,19 +457,13 @@ app.post(
 
       res.setHeader(
         "Content-Disposition",
-        'attachment; filename="AI_Reel_9x16.mp4"'
+        'attachment; filename="AI_Reel_9x16_HighQuality.mp4"'
       );
 
       res.setHeader(
         "Content-Length",
         stats.size
       );
-
-      /*
-      ------------------------------------------
-      EXTRA HEADERS
-      ------------------------------------------
-      */
 
       res.setHeader(
         "X-Video-Ratio",
@@ -714,20 +481,28 @@ app.post(
       );
 
       res.setHeader(
+        "X-Video-Duration",
+        String(duration)
+      );
+
+      res.setHeader(
         "X-Video-Speed",
         "original"
       );
 
       res.setHeader(
-        "X-Video-Duration",
-        String(duration)
+        "X-Video-Audio",
+        "original"
       );
 
-      /*
-      ------------------------------------------
-      STREAM
-      ------------------------------------------
-      */
+      res.setHeader(
+        "X-Video-Quality",
+        "high"
+      );
+
+      /* ------------------------------------------
+      STREAM OUTPUT
+      ------------------------------------------ */
 
       const stream =
         fs.createReadStream(
@@ -736,23 +511,19 @@ app.post(
 
       stream.on(
         "error",
-        (error) => {
+        error => {
           console.error(
-            "[STREAM] ERROR:",
+            "[STREAM ERROR]",
             error
           );
 
-          cleanupFiles(
-            inputPath,
-            outputPath
-          );
+          cleanup(inputPath);
+          cleanup(outputPath);
 
-          if (
-            !res.headersSent
-          ) {
+          if (!res.headersSent) {
             res.status(500).json({
               error:
-                "Could not send video.",
+                "Could not send MP4.",
               details:
                 error.message,
             });
@@ -764,7 +535,7 @@ app.post(
         "end",
         () => {
           console.log(
-            "[STREAM] MP4 completely sent."
+            "[STREAM] MP4 SENT"
           );
         }
       );
@@ -772,47 +543,37 @@ app.post(
       stream.on(
         "close",
         () => {
-          console.log(
-            "[STREAM] Closing."
-          );
+          cleanup(inputPath);
+          cleanup(outputPath);
 
-          cleanupFiles(
-            inputPath,
-            outputPath
+          console.log(
+            "[CLEANUP] COMPLETE"
           );
         }
       );
 
       stream.pipe(res);
+
     } catch (error) {
-      console.error("");
 
+      console.error("");
       console.error(
         "=========================================="
       );
 
       console.error(
-        "[CUT] VIDEO CREATION ERROR"
+        "[ERROR]",
+        error.message
       );
 
       console.error(
         "=========================================="
       );
 
-      console.error(
-        error
-      );
+      cleanup(inputPath);
+      cleanup(outputPath);
 
-      console.error("");
-
-      cleanupFiles(
-        inputPath,
-        outputPath
-      );
-
-      if (
-        !res.headersSent
-      ) {
+      if (!res.headersSent) {
         res.status(500).json({
           error:
             "Video creation failed.",
@@ -824,33 +585,21 @@ app.post(
   }
 );
 
-/*
-==================================================
-MULTER / SERVER ERROR HANDLER
-==================================================
-*/
+/* ==================================================
+ERROR HANDLER
+================================================== */
 
 app.use(
-  (
-    err,
-    req,
-    res,
-    next
-  ) => {
-    console.error(
-      "[SERVER ERROR]"
-    );
+  (err, req, res, next) => {
 
     console.error(
+      "[SERVER ERROR]",
       err
     );
 
-    if (
-      !res.headersSent
-    ) {
+    if (!res.headersSent) {
       res.status(500).json({
-        error:
-          "Server error",
+        error: "Server error",
         details:
           err.message,
       });
@@ -858,26 +607,22 @@ app.use(
   }
 );
 
-/*
-==================================================
-START SERVER
-==================================================
-*/
+/* ==================================================
+START
+================================================== */
 
 app.listen(
   PORT,
   "0.0.0.0",
   () => {
-    console.log("");
 
+    console.log("");
     console.log(
       "=========================================="
     );
-
     console.log(
-      "AI REEL BACKEND STARTED"
+      "AI REEL BACKEND READY"
     );
-
     console.log(
       "=========================================="
     );
@@ -888,7 +633,7 @@ app.listen(
     );
 
     console.log(
-      "Format: 9:16 Vertical"
+      "Format: 9:16"
     );
 
     console.log(
@@ -896,11 +641,19 @@ app.listen(
     );
 
     console.log(
-      "Speed: Original"
+      "Quality: HIGH"
     );
 
     console.log(
-      "Audio: Original"
+      "CRF: 18"
+    );
+
+    console.log(
+      "Speed: ORIGINAL"
+    );
+
+    console.log(
+      "Audio: ORIGINAL"
     );
 
     console.log(
@@ -908,13 +661,7 @@ app.listen(
     );
 
     console.log(
-      "FFmpeg: Ready"
-    );
-
-    console.log(
       "=========================================="
     );
-
-    console.log("");
   }
 );
