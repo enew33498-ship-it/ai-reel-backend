@@ -1,395 +1,334 @@
 const express = require("express");
-const cors = require("cors");
 const multer = require("multer");
+const cors = require("cors");
 const fs = require("fs");
 const path = require("path");
-const os = require("os");
 const { spawn } = require("child_process");
+const crypto = require("crypto");
 
 const app = express();
 
 const PORT = process.env.PORT || 10000;
 
-/* ================================================
-   CORS
-================================================ */
+// -----------------------------
+// MIDDLEWARE
+// -----------------------------
+app.use(cors());
+app.use(express.json({ limit: "50mb" }));
 
-app.use(
-  cors({
-    origin: "*",
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Accept"],
-  })
-);
+// -----------------------------
+// UPLOAD SETTINGS
+// -----------------------------
+const uploadDir = "/tmp/uploads";
 
-app.use(express.json());
+if (!fs.existsSync(uploadDir)) {
+  fs.mkdirSync(uploadDir, { recursive: true });
+}
 
-/* ================================================
-   UPLOAD
-================================================ */
-
-const upload = multer({
-  dest: os.tmpdir(),
-
-  limits: {
-    fileSize: 5 * 1024 * 1024 * 1024,
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, uploadDir);
   },
+
+  filename: (req, file, cb) => {
+    const uniqueName =
+      Date.now() +
+      "-" +
+      crypto.randomBytes(8).toString("hex") +
+      path.extname(file.originalname || ".mp4");
+
+    cb(null, uniqueName);
+  }
 });
 
-/* ================================================
-   HEALTH CHECK
-================================================ */
+const upload = multer({
+  storage,
 
+  limits: {
+    fileSize: 500 * 1024 * 1024
+  }
+});
+
+// -----------------------------
+// HOME / WAKE ENDPOINT
+// -----------------------------
 app.get("/", (req, res) => {
   res.status(200).json({
-    status: "ok",
-    service: "AI Reel Optimized Backend",
-    endpoint: "/cut",
+    status: "online",
+    service: "AI REEL HIGH QUALITY BACKEND",
     output: "1080x1920",
     ratio: "9:16",
-    quality: "optimized-high",
-    speed: "original",
-    audio: "original",
+    quality: "MAX PRACTICAL QUALITY",
+    videoSpeed: "ORIGINAL",
+    audio: "ORIGINAL"
   });
 });
 
-/* ================================================
-   HELPERS
-================================================ */
+app.get("/health", (req, res) => {
+  res.status(200).json({
+    ok: true,
+    status: "healthy"
+  });
+});
 
-function safeNumber(value, fallback) {
-  const number = Number(value);
+// -----------------------------
+// CREATE VIDEO
+// -----------------------------
+app.post("/cut", upload.any(), async (req, res) => {
 
-  return Number.isFinite(number)
-    ? number
-    : fallback;
-}
+  let inputPath = null;
+  let outputPath = null;
 
-function cleanup(filePath) {
   try {
-    if (filePath && fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
-      console.log("[CLEANUP] Deleted:", filePath);
+
+    console.log("");
+    console.log("================================");
+    console.log("[CUT] NEW HIGH QUALITY REQUEST");
+    console.log("================================");
+
+    // Accept any uploaded field name
+    const file = req.files && req.files.length
+      ? req.files[0]
+      : null;
+
+    if (!file) {
+      return res.status(400).json({
+        error: "No video file received."
+      });
     }
-  } catch (error) {
-    console.log("[CLEANUP ERROR]", error.message);
-  }
-}
 
-function getFFmpegPath() {
-  return process.env.FFMPEG_PATH || "ffmpeg";
-}
+    inputPath = file.path;
 
-/* ================================================
-   VIDEO CUT API
-================================================ */
+    const start = Number(req.body.start || 0);
+    const duration = Number(req.body.duration || 30);
 
-app.post(
-  "/cut",
-  upload.single("video"),
+    if (!Number.isFinite(start) || start < 0) {
+      return res.status(400).json({
+        error: "Invalid start time."
+      });
+    }
 
-  async (req, res) => {
-    let inputPath = null;
-    let outputPath = null;
+    if (!Number.isFinite(duration) || duration <= 0) {
+      return res.status(400).json({
+        error: "Invalid duration."
+      });
+    }
 
-    try {
+    const outputName =
+      "AI_Reel_" +
+      Date.now() +
+      "_" +
+      crypto.randomBytes(6).toString("hex") +
+      ".mp4";
+
+    outputPath = path.join("/tmp", outputName);
+
+    console.log("[INPUT]", file.originalname);
+    console.log(
+      "[SIZE]",
+      (file.size / 1024 / 1024).toFixed(2) + " MB"
+    );
+    console.log("[START]", start);
+    console.log("[DURATION]", duration);
+    console.log("[OUTPUT] 1080x1920");
+    console.log("[QUALITY] HIGH");
+    console.log("[VIDEO SPEED] ORIGINAL");
+    console.log("[AUDIO] ORIGINAL");
+
+    /*
+      IMPORTANT:
+
+      Original video is landscape.
+      This creates a 9:16 vertical reel by:
+
+      1. Scaling with Lanczos
+      2. Filling 1080x1920
+      3. Center cropping
+      4. Keeping original playback speed
+      5. Copying original AAC audio without re-encoding
+    */
+
+    const vf =
+      "scale=1080:1920:" +
+      "force_original_aspect_ratio=increase:" +
+      "flags=lanczos," +
+      "crop=1080:1920," +
+      "setsar=1," +
+      "format=yuv420p";
+
+    const ffmpegArgs = [
+
+      "-hide_banner",
+      "-y",
+
+      // Accurate seeking
+      "-ss",
+      String(start),
+
+      "-i",
+      inputPath,
+
+      "-t",
+      String(duration),
+
+      "-vf",
+      vf,
+
+      // Video
+      "-map",
+      "0:v:0",
+
+      // Audio if available
+      "-map",
+      "0:a:0?",
+
+      // High quality H.264
+      "-c:v",
+      "libx264",
+
+      // Better compression/quality than veryfast
+      "-preset",
+      "medium",
+
+      // Higher quality
+      "-crf",
+      "17",
+
+      "-profile:v",
+      "high",
+
+      "-level:v",
+      "4.2",
+
+      "-pix_fmt",
+      "yuv420p",
+
+      // Quality bitrate safety
+      "-maxrate",
+      "14M",
+
+      "-bufsize",
+      "28M",
+
+      // Preserve original audio stream
+      "-c:a",
+      "copy",
+
+      // Better MP4 streaming
+      "-movflags",
+      "+faststart",
+
+      outputPath
+    ];
+
+    console.log("");
+    console.log("[FFMPEG STARTING]");
+    console.log("ffmpeg " + ffmpegArgs.join(" "));
+    console.log("");
+
+    const ffmpeg = spawn("ffmpeg", ffmpegArgs);
+
+    let ffmpegError = "";
+
+    ffmpeg.stderr.on("data", (data) => {
+
+      const text = data.toString();
+
+      // Render logs
+      process.stdout.write("[FFMPEG] " + text);
+
+      ffmpegError += text;
+
+      // Prevent unlimited memory growth
+      if (ffmpegError.length > 20000) {
+        ffmpegError =
+          ffmpegError.slice(-20000);
+      }
+    });
+
+    ffmpeg.on("error", (error) => {
+
+      console.error(
+        "[FFMPEG SPAWN ERROR]",
+        error.message
+      );
+
+      if (inputPath && fs.existsSync(inputPath)) {
+        fs.unlinkSync(inputPath);
+      }
+
+      return res.status(500).json({
+        error: "FFmpeg could not start.",
+        details: error.message
+      });
+    });
+
+    ffmpeg.on("close", (code) => {
+
       console.log("");
-      console.log("================================");
-      console.log("[CUT] NEW REQUEST");
-      console.log("================================");
+      console.log("[FFMPEG EXIT CODE]", code);
 
-      /* --------------------------------------------
-         CHECK VIDEO
-      -------------------------------------------- */
+      if (code !== 0) {
 
-      if (!req.file) {
-        return res.status(400).json({
-          error: "No video received.",
+        console.error("[FFMPEG FAILED]");
+
+        if (
+          inputPath &&
+          fs.existsSync(inputPath)
+        ) {
+          fs.unlinkSync(inputPath);
+        }
+
+        return res.status(500).json({
+          error: "Video creation failed.",
+          details: ffmpegError.slice(-3000)
         });
       }
 
-      inputPath = req.file.path;
+      if (
+        !outputPath ||
+        !fs.existsSync(outputPath)
+      ) {
 
-      /* --------------------------------------------
-         START
-      -------------------------------------------- */
+        console.error(
+          "[ERROR] Output file missing"
+        );
 
-      let start = safeNumber(
-        req.body.start,
-        0
-      );
-
-      if (start < 0) {
-        start = 0;
+        return res.status(500).json({
+          error: "Output video was not created."
+        });
       }
 
-      /* --------------------------------------------
-         DURATION
-      -------------------------------------------- */
-
-      let duration = safeNumber(
-        req.body.duration,
-        NaN
-      );
-
-      if (!Number.isFinite(duration)) {
-        duration = safeNumber(
-          req.body.clipDuration,
-          30
-        );
-      }
-
-      duration = Math.max(
-        1,
-        Math.min(600, duration)
-      );
-
-      /* --------------------------------------------
-         LOG
-      -------------------------------------------- */
-
-      console.log("[INPUT]", req.file.originalname);
-
-      console.log(
-        "[SIZE]",
-        (req.file.size / 1024 / 1024).toFixed(2),
-        "MB"
-      );
-
-      console.log("[START]", start);
-
-      console.log("[DURATION]", duration);
-
-      /* --------------------------------------------
-         OUTPUT FILE
-      -------------------------------------------- */
-
-      outputPath = path.join(
-        os.tmpdir(),
-        "reel_" +
-          Date.now() +
-          "_" +
-          Math.random()
-            .toString(36)
-            .slice(2) +
-          ".mp4"
-      );
-
-      /* ============================================
-         FAST HIGH QUALITY FILTER
-
-         Lanczos removed because it is CPU-heavy.
-
-         Bicubic gives good quality while being
-         significantly faster on Render.
-      ============================================ */
-
-      const videoFilter =
-        "scale=1080:1920:" +
-        "force_original_aspect_ratio=increase:" +
-        "flags=bicubic," +
-        "crop=1080:1920," +
-        "setsar=1," +
-        "format=yuv420p";
-
-      /* ============================================
-         FFMPEG
-
-         OPTIMIZED FOR RENDER
-
-         -ss before input = faster seeking
-         veryfast preset = much faster encoding
-         CRF 20 = good quality + faster processing
-         1080x1920 remains unchanged
-         No speed changes
-      ============================================ */
-
-      const args = [
-        "-hide_banner",
-
-        "-loglevel",
-        "error",
-
-        "-y",
-
-        /* FAST SEEK */
-
-        "-ss",
-        String(start),
-
-        /* INPUT */
-
-        "-i",
-        inputPath,
-
-        /* DURATION */
-
-        "-t",
-        String(duration),
-
-        /* VIDEO FILTER */
-
-        "-vf",
-        videoFilter,
-
-        /* MAP VIDEO */
-
-        "-map",
-        "0:v:0",
-
-        /* MAP AUDIO IF AVAILABLE */
-
-        "-map",
-        "0:a:0?",
-
-        /* VIDEO CODEC */
-
-        "-c:v",
-        "libx264",
-
-        /* IMPORTANT: FAST */
-
-        "-preset",
-        "veryfast",
-
-        /* GOOD QUALITY */
-
-        "-crf",
-        "20",
-
-        /* COMPATIBILITY */
-
-        "-pix_fmt",
-        "yuv420p",
-
-        /* PREVENT EXCESSIVE CPU SETTINGS */
-
-        "-threads",
-        "0",
-
-        /* AUDIO */
-
-        "-c:a",
-        "aac",
-
-        "-b:a",
-        "160k",
-
-        /* ORIGINAL AUDIO TIMING */
-
-        "-ar",
-        "44100",
-
-        /* FASTSTART */
-
-        "-movflags",
-        "+faststart",
-
-        /* OUTPUT */
-
-        outputPath,
-      ];
-
-      const ffmpegPath = getFFmpegPath();
-
-      console.log("");
-      console.log("[FFMPEG STARTING]");
-      console.log(
-        ffmpegPath + " " + args.join(" ")
-      );
-
-      /* ============================================
-         RUN FFMPEG
-      ============================================ */
-
-      await new Promise((resolve, reject) => {
-        const ffmpeg = spawn(
-          ffmpegPath,
-          args
-        );
-
-        let errorOutput = "";
-
-        ffmpeg.stderr.on(
-          "data",
-          (data) => {
-            const text = data.toString();
-
-            errorOutput += text;
-
-            console.log("[FFMPEG]", text);
-          }
-        );
-
-        ffmpeg.on(
-          "error",
-          (error) => {
-            reject(error);
-          }
-        );
-
-        ffmpeg.on(
-          "close",
-          (code) => {
-            console.log(
-              "[FFMPEG EXIT CODE]",
-              code
-            );
-
-            if (code === 0) {
-              resolve();
-            } else {
-              reject(
-                new Error(
-                  "FFmpeg failed.\n" +
-                    errorOutput.slice(-5000)
-                )
-              );
-            }
-          }
-        );
-      });
-
-      /* ============================================
-         CHECK OUTPUT
-      ============================================ */
-
-      if (!fs.existsSync(outputPath)) {
-        throw new Error(
-          "MP4 output was not created."
-        );
-      }
-
-      const stats = fs.statSync(outputPath);
-
-      if (stats.size <= 0) {
-        throw new Error(
-          "Generated MP4 is empty."
-        );
-      }
+      const outputSize =
+        fs.statSync(outputPath).size;
 
       console.log("");
       console.log("================================");
-      console.log("[SUCCESS] MP4 CREATED");
-      console.log("================================");
-
+      console.log("[SUCCESS] VIDEO CREATED");
       console.log(
         "[OUTPUT SIZE]",
-        (stats.size / 1024 / 1024).toFixed(2),
-        "MB"
+        (outputSize / 1024 / 1024).toFixed(2) + " MB"
       );
-
-      console.log("[OUTPUT] 1080x1920");
-      console.log("[RATIO] 9:16");
-      console.log("[QUALITY] OPTIMIZED HIGH");
+      console.log("[RESOLUTION] 1080x1920");
+      console.log("[QUALITY] CRF 17");
       console.log("[SPEED] ORIGINAL");
-      console.log("[AUDIO] ORIGINAL");
+      console.log("[AUDIO] ORIGINAL STREAM");
+      console.log("================================");
 
-      /* ============================================
-         SEND VIDEO
-      ============================================ */
-
-      res.status(200);
+      // Delete uploaded source
+      if (
+        inputPath &&
+        fs.existsSync(inputPath)
+      ) {
+        try {
+          fs.unlinkSync(inputPath);
+        } catch (e) {
+          console.error(
+            "[CLEANUP INPUT ERROR]",
+            e.message
+          );
+        }
+      }
 
       res.setHeader(
         "Content-Type",
@@ -398,129 +337,111 @@ app.post(
 
       res.setHeader(
         "Content-Disposition",
-        'attachment; filename="AI_Reel_9x16.mp4"'
+        'attachment; filename="AI_Reel_HighQuality_1080x1920.mp4"'
       );
 
-      res.setHeader(
-        "Content-Length",
-        stats.size
-      );
+      const stream =
+        fs.createReadStream(outputPath);
 
-      res.setHeader(
-        "X-Video-Width",
-        "1080"
-      );
+      stream.pipe(res);
 
-      res.setHeader(
-        "X-Video-Height",
-        "1920"
-      );
+      stream.on("close", () => {
 
-      res.setHeader(
-        "X-Video-Ratio",
-        "9:16"
-      );
+        if (
+          outputPath &&
+          fs.existsSync(outputPath)
+        ) {
+          try {
+            fs.unlinkSync(outputPath);
 
-      res.setHeader(
-        "X-Video-Speed",
-        "original"
-      );
+            console.log(
+              "[CLEANUP] Output deleted from server"
+            );
 
-      res.setHeader(
-        "X-Video-Audio",
-        "original"
-      );
-
-      const stream = fs.createReadStream(
-        outputPath
-      );
+          } catch (e) {
+            console.error(
+              "[CLEANUP OUTPUT ERROR]",
+              e.message
+            );
+          }
+        }
+      });
 
       stream.on("error", (error) => {
+
         console.error(
           "[STREAM ERROR]",
           error.message
         );
 
-        cleanup(inputPath);
-        cleanup(outputPath);
-
         if (!res.headersSent) {
-          res.status(500).json({
-            error: "Could not send MP4.",
-          });
+          res.status(500).end();
         }
       });
-
-      /* Cleanup after response finishes */
-
-      res.on("finish", () => {
-        console.log(
-          "[RESPONSE] MP4 sent successfully"
-        );
-
-        cleanup(inputPath);
-        cleanup(outputPath);
-      });
-
-      stream.pipe(res);
-
-    } catch (error) {
-
-      console.error("");
-      console.error("================================");
-      console.error("[CUT ERROR]");
-      console.error("================================");
-      console.error(error);
-
-      cleanup(inputPath);
-      cleanup(outputPath);
-
-      if (!res.headersSent) {
-        res.status(500).json({
-          error: "Video creation failed.",
-          details: error.message,
-        });
-      }
-    }
-  }
-);
-
-/* ================================================
-   ERROR HANDLER
-================================================ */
-
-app.use((err, req, res, next) => {
-  console.error("[SERVER ERROR]", err);
-
-  if (!res.headersSent) {
-    res.status(500).json({
-      error: "Server error.",
-      details: err.message,
     });
+
+  } catch (error) {
+
+    console.error("");
+    console.error("================================");
+    console.error("[SERVER ERROR]");
+    console.error(error);
+    console.error("================================");
+
+    if (
+      inputPath &&
+      fs.existsSync(inputPath)
+    ) {
+      try {
+        fs.unlinkSync(inputPath);
+      } catch (e) {}
+    }
+
+    if (
+      outputPath &&
+      fs.existsSync(outputPath)
+    ) {
+      try {
+        fs.unlinkSync(outputPath);
+      } catch (e) {}
+    }
+
+    if (!res.headersSent) {
+      res.status(500).json({
+        error: "Server error while creating video.",
+        details: error.message
+      });
+    }
   }
 });
 
-/* ================================================
-   START SERVER
-================================================ */
+// -----------------------------
+// 404
+// -----------------------------
+app.use((req, res) => {
+  res.status(404).json({
+    error: "Route not found."
+  });
+});
 
-app.listen(
-  PORT,
-  "0.0.0.0",
-  () => {
-    console.log("");
-    console.log("================================");
-    console.log("AI REEL OPTIMIZED BACKEND");
-    console.log("================================");
-    console.log("PORT:", PORT);
-    console.log("OUTPUT: 1080x1920");
-    console.log("RATIO: 9:16");
-    console.log("QUALITY: OPTIMIZED HIGH");
-    console.log("VIDEO SPEED: ORIGINAL");
-    console.log("AUDIO: ORIGINAL");
-    console.log("CRF: 20");
-    console.log("PRESET: VERYFAST");
-    console.log("================================");
-    console.log("");
-  }
-);
+// -----------------------------
+// START SERVER
+// -----------------------------
+app.listen(PORT, "0.0.0.0", () => {
+
+  console.log("");
+  console.log("================================");
+  console.log("AI REEL MAX QUALITY BACKEND");
+  console.log("================================");
+  console.log("PORT:", PORT);
+  console.log("OUTPUT: 1080x1920");
+  console.log("RATIO: 9:16");
+  console.log("QUALITY: MAX PRACTICAL");
+  console.log("VIDEO SPEED: ORIGINAL");
+  console.log("AUDIO: ORIGINAL");
+  console.log("CRF: 17");
+  console.log("PRESET: MEDIUM");
+  console.log("AUDIO MODE: COPY");
+  console.log("================================");
+  console.log("");
+});
