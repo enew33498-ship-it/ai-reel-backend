@@ -1,1 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 
+<title>Voice Engine V3 Test</title>
+
+<style>
+body{
+  margin:0;
+  padding:20px;
+  background:#090d18;
+  color:white;
+  font-family:Arial,sans-serif;
+}
+
+.box{
+  max-width:700px;
+  margin:auto;
+  background:#111827;
+  padding:20px;
+  border-radius:18px;
+}
+
+h1{
+  color:#9b7cff;
+}
+
+input{
+  width:100%;
+  margin:15px 0;
+}
+
+button{
+  width:100%;
+  padding:16px;
+  border:0;
+  border-radius:12px;
+  background:linear-gradient(90deg,#087cff,#8b35ff);
+  color:white;
+  font-size:18px;
+  font-weight:bold;
+}
+
+#status{
+  margin-top:20px;
+  padding:15px;
+  background:#080b12;
+  border-radius:12px;
+  white-space:pre-wrap;
+  line-height:1.6;
+}
+</style>
+</head>
+
+<body>
+
+<div class="box">
+
+<h1>🎤 Voice Engine V3 Test</h1>
+
+<p>
+Upload a video and test the Voice Engine separately.
+</p>
+
+<input
+  type="file"
+  id="videoInput"
+  accept="video/mp4,video/*"
+>
+
+<button id="testBtn">
+TEST VOICE ENGINE
+</button>
+
+<div id="status">
+Waiting for video...
+</div>
+
+</div>
+
+<script>
+
+const API_URL =
+"https://ai-reel-backend-9no6.onrender.com";
+
+const videoInput =
+document.getElementById("videoInput");
+
+const testBtn =
+document.getElementById("testBtn");
+
+const statusBox =
+document.getElementById("status");
+
+
+function log(text){
+
+  statusBox.textContent +=
+  "\n" + text;
+
+}
+
+
+testBtn.onclick = async () => {
+
+  const file =
+  videoInput.files[0];
+
+  if(!file){
+
+    statusBox.textContent =
+    "❌ Pehle video select karo.";
+
+    return;
+  }
+
+  statusBox.textContent =
+  "⏳ Uploading video to Voice Engine...\n";
+
+  testBtn.disabled = true;
+
+  try{
+
+    const formData =
+    new FormData();
+
+    formData.append(
+      "video",
+      file
+    );
+
+    const response =
+    await fetch(
+      API_URL + "/voice/analyze",
+      {
+        method:"POST",
+        body:formData
+      }
+    );
+
+    const data =
+    await response.json();
+
+    console.log(
+      "VOICE START:",
+      data
+    );
+
+    if(!data.ok){
+
+      throw new Error(
+        data.error ||
+        "Voice analysis start failed"
+      );
+
+    }
+
+    statusBox.textContent =
+    "🎤 VOICE ENGINE STARTED\n" +
+    "Job ID: " +
+    data.jobId +
+    "\n\n";
+
+    await monitorVoiceJob(
+      data.jobId
+    );
+
+  }catch(error){
+
+    statusBox.textContent =
+    "❌ ERROR\n\n" +
+    error.message;
+
+    testBtn.disabled = false;
+
+  }
+
+};
+
+
+async function monitorVoiceJob(
+  jobId
+){
+
+  const timer =
+  setInterval(async () => {
+
+    try{
+
+      const response =
+      await fetch(
+        API_URL +
+        "/voice/status/" +
+        jobId
+      );
+
+      const data =
+      await response.json();
+
+      console.log(
+        "VOICE STATUS:",
+        data
+      );
+
+      if(data.status === "processing"){
+
+        statusBox.textContent =
+        "🎤 VOICE ENGINE V3\n\n" +
+        "Status: PROCESSING\n" +
+        "Progress: " +
+        (data.progress || 0) +
+        "%\n\n" +
+        "Voice analysis running...";
+
+      }
+
+      else if(data.status === "ready"){
+
+        clearInterval(timer);
+
+        statusBox.textContent =
+        "🔥 VOICE ENGINE V3 COMPLETE\n\n" +
+        JSON.stringify(
+          data,
+          null,
+          2
+        );
+
+        testBtn.disabled = false;
+
+      }
+
+      else if(data.status === "error"){
+
+        clearInterval(timer);
+
+        statusBox.textContent =
+        "❌ VOICE ENGINE ERROR\n\n" +
+        (data.error ||
+        "Unknown error");
+
+        testBtn.disabled = false;
+
+      }
+
+    }catch(error){
+
+      clearInterval(timer);
+
+      statusBox.textContent =
+      "❌ STATUS ERROR\n\n" +
+      error.message;
+
+      testBtn.disabled = false;
+
+    }
+
+  },2000);
+
+}
+
+</script>
+
+</body>
+  </html>
