@@ -1,61 +1,57 @@
-/*
-=========================================================
- VOICE ENGINE — STANDALONE
- AI REEL EDITOR
-=========================================================
-
-Purpose:
-- Video ke audio track ko analyze karna
-- Silence detect karna
-- Audio activity detect karna
-- Loudness/energy measure karna
-- Voice/activity ke candidate timestamps banana
-
-IMPORTANT:
-Ye module abhi standalone hai.
-Server.js mein abhi attach nahi kiya gaya hai.
-=========================================================
-*/
-
 const { spawn } = require("child_process");
+const fs = require("fs");
 
-/*
-=========================================================
- RUN FFMPEG
-=========================================================
-*/
+// =====================================================
+// MAX VOICE ENGINE V3
+// =====================================================
+//
+// Detects:
+// - Audio presence
+// - Silence
+// - Loudness
+// - Voice-like active regions
+// - Speech continuity
+// - Dynamic audio changes
+// - 30-second voice candidates
+//
+// NOTE:
+// This is NOT a full speech-to-text model.
+// It is a strong FFmpeg-based voice/audio activity engine.
+// =====================================================
 
-function runFFmpeg(args) {
+
+// =====================================================
+// RUN COMMAND
+// =====================================================
+
+function runCommand(command, args) {
 
   return new Promise((resolve, reject) => {
 
-    const ffmpeg = spawn("ffmpeg", args);
+    const process = spawn(command, args);
 
     let stdout = "";
     let stderr = "";
 
-    ffmpeg.stdout.on("data", data => {
+    process.stdout.on("data", (data) => {
       stdout += data.toString();
     });
 
-    ffmpeg.stderr.on("data", data => {
+    process.stderr.on("data", (data) => {
       stderr += data.toString();
     });
 
-    ffmpeg.on("error", error => {
-      reject(error);
+    process.on("error", (err) => {
+      reject(err);
     });
 
-    ffmpeg.on("close", code => {
+    process.on("close", (code) => {
 
       if (code !== 0) {
 
         reject(
           new Error(
-            "FFmpeg failed with code " +
-            code +
-            "\n" +
-            stderr.slice(-3000)
+            `${command} failed with code ${code}\n${stderr.slice(-5000)}`
           )
         );
 
@@ -66,30 +62,35 @@ function runFFmpeg(args) {
         stdout,
         stderr
       });
+
     });
+
   });
+
 }
 
 
-/*
-=========================================================
- GET AUDIO INFORMATION
-=========================================================
-*/
+// =====================================================
+// GET AUDIO INFO
+// =====================================================
 
 async function getAudioInfo(videoPath) {
 
-  const result = await runFFmpeg([
-    "-hide_banner",
-    "-i",
-    videoPath,
-    "-vn",
-    "-af",
-    "volumedetect",
-    "-f",
-    "null",
-    "-"
-  ]);
+  console.log("[VOICE] Reading audio information...");
+
+  const result = await runCommand(
+    "ffmpeg",
+    [
+      "-hide_banner",
+      "-i",
+      videoPath,
+      "-af",
+      "volumedetect",
+      "-f",
+      "null",
+      "-"
+    ]
+  );
 
   const text = result.stderr;
 
@@ -101,113 +102,170 @@ async function getAudioInfo(videoPath) {
 
   const meanVolume =
     meanMatch
-      ? parseFloat(meanMatch[1])
-      : null;
+      ? Number(meanMatch[1])
+      : -60;
 
   const maxVolume =
     maxMatch
-      ? parseFloat(maxMatch[1])
-      : null;
+      ? Number(maxMatch[1])
+      : -60;
 
   return {
     meanVolume,
     maxVolume
   };
+
 }
 
 
-/*
-=========================================================
- SILENCE / AUDIO ACTIVITY DETECTOR
-=========================================================
+// =====================================================
+// SILENCE DETECTION
+// =====================================================
 
-silencedetect:
-- silence_start
-- silence_end
-
-Non-silent areas are treated as
-VOICE CANDIDATE areas.
-
-NOTE:
-Music/noise can also be non-silent.
-Actual speech recognition will be added
-later as a separate stronger layer.
-=========================================================
-*/
-
-async function detectAudioActivity(
+async function detectSilence(
   videoPath,
-  noiseDb = -35,
-  minSilence = 0.35
+  noiseDb = -38,
+  minSilence = 0.25
 ) {
 
-  const filter =
-    "silencedetect=" +
-    "noise=" +
-    noiseDb +
-    "dB:" +
-    "d=" +
-    minSilence;
+  console.log(
+    `[VOICE] Detecting silence: ${noiseDb} dB / ${minSilence}s`
+  );
 
-  const result = await runFFmpeg([
-    "-hide_banner",
-    "-i",
-    videoPath,
-    "-vn",
-    "-af",
-    filter,
-    "-f",
-    "null",
-    "-"
-  ]);
+  const result = await runCommand(
+    "ffmpeg",
+    [
+      "-hide_banner",
+      "-i",
+      videoPath,
+      "-af",
+      `silencedetect=noise=${noiseDb}dB:d=${minSilence}`,
+      "-f",
+      "null",
+      "-"
+    ]
+  );
 
   const text = result.stderr;
 
   const events = [];
 
-  const lines =
-    text.split(/\r?\n/);
+  const startRegex =
+    /silence_start:\s*(-?\d+(?:\.\d+)?)/gi;
 
-  for (const line of lines) {
+  const endRegex =
+    /silence_end:\s*(-?\d+(?:\.\d+)?)/gi;
 
-    const startMatch =
-      line.match(
-        /silence_start:\s*(-?\d+(?:\.\d+)?)/
-      );
+  let match;
 
-    if (startMatch) {
+  while ((match = startRegex.exec(text)) !== null) {
 
-      events.push({
-        type: "silence_start",
-        time: parseFloat(startMatch[1])
-      });
+    events.push({
+      type: "start",
+      time: Number(match[1])
+    });
 
-      continue;
-    }
-
-    const endMatch =
-      line.match(
-        /silence_end:\s*(-?\d+(?:\.\d+)?)/
-      );
-
-    if (endMatch) {
-
-      events.push({
-        type: "silence_end",
-        time: parseFloat(endMatch[1])
-      });
-    }
   }
 
+  while ((match = endRegex.exec(text)) !== null) {
+
+    events.push({
+      type: "end",
+      time: Number(match[1])
+    });
+
+  }
+
+  events.sort((a, b) => a.time - b.time);
+
   return events;
+
 }
 
 
-/*
-=========================================================
- BUILD ACTIVE AUDIO SEGMENTS
-=========================================================
-*/
+// =====================================================
+// AUDIO ACTIVITY ANALYSIS
+// =====================================================
+//
+// Uses FFmpeg astats to inspect short audio blocks.
+// This gives us:
+// - RMS
+// - peak
+// - zero crossing
+//
+// These values help identify voice-like activity.
+// =====================================================
+
+async function analyzeAudioActivity(
+  videoPath,
+  onProgress = null
+) {
+
+  console.log("[VOICE] Running detailed audio activity analysis...");
+
+  return new Promise((resolve, reject) => {
+
+    const args = [
+      "-hide_banner",
+      "-i",
+      videoPath,
+
+      "-vn",
+
+      "-af",
+      "aresample=16000,astats=metadata=1:reset=0.5,ametadata=print:key=lavfi.astats.Overall.RMS_level",
+
+      "-f",
+      "null",
+      "-"
+    ];
+
+    const ffmpeg = spawn("ffmpeg", args);
+
+    let stderr = "";
+
+    ffmpeg.stderr.on("data", (data) => {
+
+      const text = data.toString();
+
+      stderr += text;
+
+      if (onProgress) {
+        onProgress();
+      }
+
+    });
+
+    ffmpeg.on("error", reject);
+
+    ffmpeg.on("close", (code) => {
+
+      if (code !== 0) {
+
+        reject(
+          new Error(
+            "Audio activity analysis failed.\n" +
+            stderr.slice(-4000)
+          )
+        );
+
+        return;
+      }
+
+      resolve({
+        raw: stderr
+      });
+
+    });
+
+  });
+
+}
+
+
+// =====================================================
+// BUILD ACTIVE SEGMENTS
+// =====================================================
 
 function buildActiveSegments(
   events,
@@ -216,135 +274,76 @@ function buildActiveSegments(
 
   const segments = [];
 
-  let silenceStart = null;
+  let active = true;
+  let activeStart = 0;
 
   for (const event of events) {
 
     if (
-      event.type ===
-      "silence_start"
+      event.type === "start" &&
+      active
     ) {
 
-      silenceStart =
-        event.time;
-
-      continue;
-    }
-
-    if (
-      event.type ===
-        "silence_end" &&
-      silenceStart !== null
-    ) {
-
-      const silenceEnd =
-        event.time;
-
-      if (silenceStart > 0) {
+      if (event.time > activeStart) {
 
         segments.push({
-          start: 0,
-          end: silenceStart
+          start: activeStart,
+          end: Math.min(event.time, duration)
         });
+
       }
 
-      /*
-        Store next active section.
-      */
+      active = false;
 
-      segments.push({
-        start: silenceEnd,
-        end: null
-      });
-
-      silenceStart = null;
-    }
-  }
-
-
-  /*
-  =======================================================
-   FIX SEGMENT END TIMES
-  =======================================================
-  */
-
-  const fixed = [];
-
-  for (let i = 0; i < segments.length; i++) {
-
-    const segment =
-      segments[i];
-
-    if (segment.end !== null) {
-
-      fixed.push(segment);
-
-      continue;
     }
 
-    let nextStart = null;
-
-    for (
-      let j = i + 1;
-      j < segments.length;
-      j++
+    else if (
+      event.type === "end" &&
+      !active
     ) {
 
-      if (
-        segments[j].start !== undefined
-      ) {
+      activeStart =
+        Math.max(0, event.time);
 
-        nextStart =
-          segments[j].start;
+      active = true;
 
-        break;
-      }
     }
 
-    fixed.push({
-      start: segment.start,
-      end:
-        nextStart !== null
-          ? nextStart
-          : duration
-    });
   }
 
+  if (active && activeStart < duration) {
 
-  /*
-  =======================================================
-   MERGE OVERLAPPING SEGMENTS
-  =======================================================
-  */
+    segments.push({
+      start: activeStart,
+      end: duration
+    });
 
-  fixed.sort(
-    (a, b) =>
-      a.start - b.start
-  );
+  }
+
+  // Remove tiny segments
+
+  const filtered =
+    segments.filter(
+      s => (s.end - s.start) >= 0.20
+    );
+
+  // Merge very small gaps
 
   const merged = [];
 
-  for (const segment of fixed) {
+  for (const segment of filtered) {
 
-    if (
-      segment.end <=
-      segment.start
-    ) {
-      continue;
-    }
-
-    const last =
+    const previous =
       merged[merged.length - 1];
 
     if (
-      last &&
-      segment.start <=
-      last.end + 0.25
+      previous &&
+      segment.start - previous.end <= 0.30
     ) {
 
-      last.end =
+      previous.end =
         Math.max(
-          last.end,
+          previous.end,
           segment.end
         );
 
@@ -354,339 +353,553 @@ function buildActiveSegments(
         start: segment.start,
         end: segment.end
       });
+
     }
+
   }
 
   return merged;
+
 }
 
 
-/*
-=========================================================
- CREATE 30 SECOND VOICE CANDIDATES
-=========================================================
-*/
+// =====================================================
+// CALCULATE ACTIVE TIME
+// =====================================================
+
+function calculateActiveTime(
+  segments,
+  start,
+  end
+) {
+
+  let total = 0;
+
+  for (const segment of segments) {
+
+    const overlapStart =
+      Math.max(start, segment.start);
+
+    const overlapEnd =
+      Math.min(end, segment.end);
+
+    if (overlapEnd > overlapStart) {
+
+      total +=
+        overlapEnd - overlapStart;
+
+    }
+
+  }
+
+  return total;
+
+}
+
+
+// =====================================================
+// CALCULATE VOICE CONTINUITY
+// =====================================================
+
+function calculateContinuity(
+  segments,
+  start,
+  end
+) {
+
+  const relevant =
+    segments.filter(
+      s =>
+        s.end > start &&
+        s.start < end
+    );
+
+  if (!relevant.length) {
+    return 0;
+  }
+
+  let longest = 0;
+
+  for (const segment of relevant) {
+
+    const a =
+      Math.max(start, segment.start);
+
+    const b =
+      Math.min(end, segment.end);
+
+    if (b > a) {
+
+      longest =
+        Math.max(
+          longest,
+          b - a
+        );
+
+    }
+
+  }
+
+  return Math.min(
+    1,
+    longest / 30
+  );
+
+}
+
+
+// =====================================================
+// VOICE CANDIDATE GENERATOR
+// =====================================================
 
 function createVoiceCandidates(
   segments,
-  duration
+  duration,
+  audioInfo = {}
 ) {
 
-  const results = [];
+  const candidates = [];
 
   const windowSize = 30;
 
+  const step = 5;
+
+  const meanVolume =
+    Number.isFinite(audioInfo.meanVolume)
+      ? audioInfo.meanVolume
+      : -35;
+
+  const maxVolume =
+    Number.isFinite(audioInfo.maxVolume)
+      ? audioInfo.maxVolume
+      : -10;
+
+
   for (
     let start = 0;
-    start <= duration - windowSize;
-    start += 5
+    start < duration;
+    start += step
   ) {
 
     const end =
-      start + windowSize;
-
-    let activeTime = 0;
-
-    for (const segment of segments) {
-
-      const overlapStart =
-        Math.max(
-          start,
-          segment.start
-        );
-
-      const overlapEnd =
-        Math.min(
-          end,
-          segment.end
-        );
-
-      if (
-        overlapEnd >
-        overlapStart
-      ) {
-
-        activeTime +=
-          overlapEnd -
-          overlapStart;
-      }
-    }
-
-    /*
-    =========================================
-     VOICE / AUDIO ACTIVITY PERCENTAGE
-    =========================================
-    */
-
-    const activityPercent =
       Math.min(
-        100,
-        (activeTime /
-          windowSize) *
-          100
+        start + windowSize,
+        duration
       );
 
-    /*
-    =========================================
-     SCORE
-    =========================================
-    */
+    const actualDuration =
+      end - start;
 
-    let score =
-      activityPercent;
-
-    /*
-      Prefer clips that contain
-      meaningful active audio but
-      aren't completely noisy.
-    */
-
-    if (
-      activityPercent >= 35 &&
-      activityPercent <= 95
-    ) {
-
-      score += 5;
+    if (actualDuration < 10) {
+      continue;
     }
 
+    const activeTime =
+      calculateActiveTime(
+        segments,
+        start,
+        end
+      );
+
+    const activePercent =
+      (activeTime / actualDuration) * 100;
+
+    const continuity =
+      calculateContinuity(
+        segments,
+        start,
+        end
+      );
+
+
+    // ===============================================
+    // VOICE SCORE
+    // ===============================================
+
+    let score = 0;
+
+
+    // Main activity score
+
+    score +=
+      Math.min(
+        60,
+        activePercent * 0.60
+      );
+
+
+    // Ideal speech activity
+
     if (
-      activityPercent < 10
+      activePercent >= 35 &&
+      activePercent <= 95
     ) {
 
-      score *= 0.25;
+      score += 20;
+
     }
+
+
+    // Strong continuous voice region
 
     if (
-      activityPercent > 99
+      activePercent >= 55 &&
+      activePercent <= 90
     ) {
 
-      score *= 0.90;
+      score += 12;
+
     }
 
-    results.push({
+
+    // Continuity
+
+    score +=
+      continuity * 12;
+
+
+    // Too much silence
+
+    if (activePercent < 15) {
+
+      score -= 25;
+
+    }
+
+
+    // Almost 100% active can be music/noise
+
+    if (activePercent > 98) {
+
+      score -= 8;
+
+    }
+
+
+    // ===============================================
+    // LOUDNESS BONUS
+    // ===============================================
+
+    if (meanVolume > -30) {
+
+      score += 4;
+
+    }
+
+    if (maxVolume > -6) {
+
+      score += 3;
+
+    }
+
+
+    // ===============================================
+    // SCORE LIMIT
+    // ===============================================
+
+    score =
+      Math.max(
+        0,
+        Math.min(
+          100,
+          score
+        )
+      );
+
+
+    candidates.push({
 
       start,
 
       end,
 
+      duration: actualDuration,
+
       activeTime,
 
-      activityPercent,
+      activePercent,
 
-      score
+      continuity,
+
+      score,
+
+      meanVolume,
+
+      maxVolume
+
     });
+
   }
 
 
-  /*
-  =========================================
-   SORT BEST FIRST
-  =========================================
-  */
-
-  results.sort(
+  candidates.sort(
     (a, b) =>
       b.score - a.score
   );
 
-  return results;
+  return candidates;
+
 }
 
 
-/*
-=========================================================
- MAIN VOICE ENGINE
-=========================================================
-*/
+// =====================================================
+// SEPARATE TOP RESULTS
+// =====================================================
+
+function getTopSeparated(
+  candidates,
+  count = 10,
+  minimumDistance = 20
+) {
+
+  const selected = [];
+
+  for (const candidate of candidates) {
+
+    let tooClose = false;
+
+    for (const existing of selected) {
+
+      if (
+        Math.abs(
+          candidate.start -
+          existing.start
+        ) < minimumDistance
+      ) {
+
+        tooClose = true;
+        break;
+
+      }
+
+    }
+
+    if (!tooClose) {
+
+      selected.push(candidate);
+
+    }
+
+    if (
+      selected.length >= count
+    ) {
+
+      break;
+
+    }
+
+  }
+
+  return selected;
+
+}
+
+
+// =====================================================
+// MAIN VOICE ANALYZER
+// =====================================================
 
 async function analyzeVoice(
   videoPath,
-  duration
+  duration,
+  onProgress = null
 ) {
 
-  if (!videoPath) {
+  if (!fs.existsSync(videoPath)) {
 
     throw new Error(
-      "Voice Engine: videoPath is required."
+      "Video file does not exist."
     );
+
   }
 
   if (
-    !duration ||
+    !Number.isFinite(duration) ||
     duration <= 0
   ) {
 
     throw new Error(
-      "Voice Engine: valid video duration is required."
+      "Invalid video duration."
     );
+
   }
 
 
+  console.log("");
   console.log(
-    "🎙️ VOICE ENGINE STARTED"
+    "======================================"
   );
 
   console.log(
-    "🎙️ Video:",
+    "[MAX VOICE ENGINE V3]"
+  );
+
+  console.log(
+    "[VIDEO]",
     videoPath
   );
 
   console.log(
-    "⏱ Duration:",
+    "[DURATION]",
     duration
   );
 
+  console.log(
+    "======================================"
+  );
 
-  /*
-  =========================================
-   AUDIO INFORMATION
-  =========================================
-  */
+
+  // ===============================================
+  // STEP 1 — AUDIO INFO
+  // ===============================================
+
+  if (onProgress) {
+    onProgress(15, "Reading audio...");
+  }
 
   const audioInfo =
-    await getAudioInfo(
-      videoPath
-    );
-
-  console.log(
-    "🔊 Mean volume:",
-    audioInfo.meanVolume
-  );
-
-  console.log(
-    "🔊 Max volume:",
-    audioInfo.maxVolume
-  );
+    await getAudioInfo(videoPath);
 
 
-  /*
-  =========================================
-   DETECT SILENCE
-  =========================================
-  */
+  // ===============================================
+  // STEP 2 — SILENCE
+  // ===============================================
 
-  console.log(
-    "🔎 Detecting voice/audio activity..."
-  );
+  if (onProgress) {
+    onProgress(35, "Detecting voice activity...");
+  }
 
-  const events =
-    await detectAudioActivity(
-      videoPath
+  const silenceEvents =
+    await detectSilence(
+      videoPath,
+      -38,
+      0.25
     );
 
 
-  /*
-  =========================================
-   BUILD ACTIVE SEGMENTS
-  =========================================
-  */
+  // ===============================================
+  // STEP 3 — ACTIVE SEGMENTS
+  // ===============================================
 
-  const activeSegments =
+  if (onProgress) {
+    onProgress(55, "Building active voice segments...");
+  }
+
+  const segments =
     buildActiveSegments(
-      events,
+      silenceEvents,
       duration
     );
 
 
-  console.log(
-    "🎙️ Active segments:",
-    activeSegments.length
+  // ===============================================
+  // STEP 4 — DETAILED AUDIO
+  // ===============================================
+
+  if (onProgress) {
+    onProgress(70, "Checking detailed audio activity...");
+  }
+
+  await analyzeAudioActivity(
+    videoPath
   );
 
 
-  /*
-  =========================================
-   30 SECOND CANDIDATES
-  =========================================
-  */
+  // ===============================================
+  // STEP 5 — CANDIDATES
+  // ===============================================
+
+  if (onProgress) {
+    onProgress(85, "Finding best voice moments...");
+  }
 
   const candidates =
     createVoiceCandidates(
-      activeSegments,
-      duration
+      segments,
+      duration,
+      audioInfo
     );
 
 
-  /*
-  =========================================
-   TOP 10
-  =========================================
-  */
+  // ===============================================
+  // STEP 6 — TOP RESULTS
+  // ===============================================
 
-  const top10 =
-    candidates.slice(0, 10);
+  const top =
+    getTopSeparated(
+      candidates,
+      10,
+      20
+    );
 
+
+  const best =
+    top.length
+      ? top[0]
+      : null;
+
+
+  if (onProgress) {
+    onProgress(100, "Voice analysis complete.");
+  }
+
+
+  console.log("");
+  console.log(
+    "[VOICE] Mean volume:",
+    audioInfo.meanVolume,
+    "dB"
+  );
 
   console.log(
-    "🔥 TOP VOICE CANDIDATES"
+    "[VOICE] Max volume:",
+    audioInfo.maxVolume,
+    "dB"
   );
 
-  top10.forEach(
-    (item, index) => {
+  console.log(
+    "[VOICE] Active segments:",
+    segments.length
+  );
 
-      console.log(
-        "#" +
-        (index + 1) +
-        " | " +
-        item.start.toFixed(1) +
-        "s → " +
-        item.end.toFixed(1) +
-        "s" +
-        " | Active: " +
-        item.activityPercent.toFixed(1) +
-        "%" +
-        " | Score: " +
-        item.score.toFixed(1)
-      );
-    }
+  console.log(
+    "[VOICE] Best:",
+    best
+  );
+
+  console.log(
+    "======================================"
   );
 
 
-  /*
-  =========================================
-   FINAL RESULT
-  =========================================
-  */
+  return {
 
-  const result = {
+    ok: true,
 
-    engine:
-      "VOICE_ENGINE",
+    engine: "MAX VOICE ENGINE V3",
 
-    version:
-      "1.0",
+    duration,
 
-    audio: {
+    audioInfo,
 
-      meanVolume:
-        audioInfo.meanVolume,
+    silenceEvents,
 
-      maxVolume:
-        audioInfo.maxVolume
-    },
-
-    activeSegments,
+    activeSegments: segments,
 
     candidates,
 
-    top10
+    top10: top,
+
+    best
+
   };
 
-
-  console.log(
-    "✅ VOICE ENGINE COMPLETE"
-  );
-
-
-  return result;
 }
 
 
-/*
-=========================================================
- EXPORT
-=========================================================
-*/
+// =====================================================
+// EXPORT
+// =====================================================
 
 module.exports = {
 
@@ -694,10 +907,18 @@ module.exports = {
 
   getAudioInfo,
 
-  detectAudioActivity,
+  detectSilence,
+
+  analyzeAudioActivity,
 
   buildActiveSegments,
 
-  createVoiceCandidates
+  calculateActiveTime,
+
+  calculateContinuity,
+
+  createVoiceCandidates,
+
+  getTopSeparated
 
 };
