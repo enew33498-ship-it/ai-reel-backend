@@ -1,344 +1,813 @@
-const { spawn } = require("child_process");
+/*
+========================================================
+ AI REEL EDITOR
+ VOICE ENGINE MAX V5
+========================================================
+
+GOAL
+----
+Maximum practical speech/voice detection for the
+AI Reel Editor.
+
+ENGINE PIPELINE
+---------------
+
+VIDEO
+  ↓
+FFmpeg
+  ↓
+16 kHz MONO WAV
+  ↓
+SILERO VAD
+  ↓
+MULTI-THRESHOLD ANALYSIS
+  ├── Sensitive
+  ├── Balanced
+  └── Strict
+  ↓
+SPEECH CONSENSUS
+  ↓
+SEGMENT MERGING
+  ↓
+VOICE FEATURES
+  ├── Speech coverage
+  ├── Average VAD
+  ├── Peak VAD
+  ├── Continuity
+  ├── Density
+  ├── Start strength
+  ├── End strength
+  ├── Stability
+  └── Confidence
+  ↓
+30 SECOND SLIDING WINDOWS
+  ↓
+TOP CANDIDATES
+  ↓
+BEST VOICE MOMENT
+
+IMPORTANT
+---------
+Existing server.js can continue using:
+
+const { analyzeVoice } = require("./voice-engine");
+
+No server.js changes are required for this engine.
+
+========================================================
+*/
+
+"use strict";
+
+
+/* ======================================================
+   IMPORTS
+====================================================== */
+
 const fs = require("fs");
+const path = require("path");
+const os = require("os");
+const crypto = require("crypto");
+const { spawn } = require("child_process");
 
-// =====================================================
-// MAX VOICE ENGINE V3
-// =====================================================
-//
-// Detects:
-// - Audio presence
-// - Silence
-// - Loudness
-// - Voice-like active regions
-// - Speech continuity
-// - Dynamic audio changes
-// - 30-second voice candidates
-//
-// NOTE:
-// This is NOT a full speech-to-text model.
-// It is a strong FFmpeg-based voice/audio activity engine.
-// =====================================================
+const {
+  File: DecibriFile
+} = require("decibri");
 
 
-// =====================================================
-// RUN COMMAND
-// =====================================================
+/* ======================================================
+   GLOBAL CONFIG
+====================================================== */
 
-function runCommand(command, args) {
+const SAMPLE_RATE = 16000;
 
-  return new Promise((resolve, reject) => {
+const CLIP_DURATION = 30;
 
-    const process = spawn(command, args);
+const WINDOW_STEP = 1;
 
-    let stdout = "";
-    let stderr = "";
+const MIN_SPEECH_DURATION = 0.12;
 
-    process.stdout.on("data", (data) => {
-      stdout += data.toString();
-    });
-
-    process.stderr.on("data", (data) => {
-      stderr += data.toString();
-    });
-
-    process.on("error", (err) => {
-      reject(err);
-    });
-
-    process.on("close", (code) => {
-
-      if (code !== 0) {
-
-        reject(
-          new Error(
-            `${command} failed with code ${code}\n${stderr.slice(-5000)}`
-          )
-        );
-
-        return;
-      }
-
-      resolve({
-        stdout,
-        stderr
-      });
-
-    });
-
-  });
-
-}
+const SEGMENT_GAP = 0.30;
 
 
-// =====================================================
-// GET AUDIO INFO
-// =====================================================
+/*
+--------------------------------------------------------
+MULTI THRESHOLD
 
-async function getAudioInfo(videoPath) {
+Sensitive:
+detects quieter speech
 
-  console.log("[VOICE] Reading audio information...");
+Balanced:
+normal speech detection
 
-  const result = await runCommand(
-    "ffmpeg",
-    [
-      "-hide_banner",
-      "-i",
-      videoPath,
-      "-af",
-      "volumedetect",
-      "-f",
-      "null",
-      "-"
-    ]
-  );
+Strict:
+strong speech detection
+--------------------------------------------------------
+*/
 
-  const text = result.stderr;
+const VAD_PROFILES = [
+  {
+    name: "sensitive",
+    threshold: 0.35,
+    holdoffMs: 250
+  },
 
-  const meanMatch =
-    text.match(/mean_volume:\s*(-?\d+(?:\.\d+)?)\s*dB/i);
+  {
+    name: "balanced",
+    threshold: 0.50,
+    holdoffMs: 300
+  },
 
-  const maxMatch =
-    text.match(/max_volume:\s*(-?\d+(?:\.\d+)?)\s*dB/i);
-
-  const meanVolume =
-    meanMatch
-      ? Number(meanMatch[1])
-      : -60;
-
-  const maxVolume =
-    maxMatch
-      ? Number(maxMatch[1])
-      : -60;
-
-  return {
-    meanVolume,
-    maxVolume
-  };
-
-}
+  {
+    name: "strict",
+    threshold: 0.65,
+    holdoffMs: 350
+  }
+];
 
 
-// =====================================================
-// SILENCE DETECTION
-// =====================================================
+/*
+--------------------------------------------------------
+TOP RESULTS
+--------------------------------------------------------
+*/
 
-async function detectSilence(
-  videoPath,
-  noiseDb = -38,
-  minSilence = 0.25
+const TOP_LIMIT = 10;
+
+const SEPARATION_SECONDS = 5;
+
+
+/*
+--------------------------------------------------------
+TEMP FILE PREFIX
+--------------------------------------------------------
+*/
+
+const TEMP_PREFIX =
+  "ai-reel-voice-max-v5";
+
+
+/* ======================================================
+   SAFE NUMBER
+====================================================== */
+
+function safeNumber(
+  value,
+  fallback = 0
 ) {
 
-  console.log(
-    `[VOICE] Detecting silence: ${noiseDb} dB / ${minSilence}s`
-  );
+  const n =
+    Number(value);
 
-  const result = await runCommand(
-    "ffmpeg",
-    [
-      "-hide_banner",
-      "-i",
-      videoPath,
-      "-af",
-      `silencedetect=noise=${noiseDb}dB:d=${minSilence}`,
-      "-f",
-      "null",
-      "-"
-    ]
-  );
+  if (
+    !Number.isFinite(n)
+  ) {
 
-  const text = result.stderr;
-
-  const events = [];
-
-  const startRegex =
-    /silence_start:\s*(-?\d+(?:\.\d+)?)/gi;
-
-  const endRegex =
-    /silence_end:\s*(-?\d+(?:\.\d+)?)/gi;
-
-  let match;
-
-  while ((match = startRegex.exec(text)) !== null) {
-
-    events.push({
-      type: "start",
-      time: Number(match[1])
-    });
+    return fallback;
 
   }
 
-  while ((match = endRegex.exec(text)) !== null) {
-
-    events.push({
-      type: "end",
-      time: Number(match[1])
-    });
-
-  }
-
-  events.sort((a, b) => a.time - b.time);
-
-  return events;
+  return n;
 
 }
 
 
-// =====================================================
-// AUDIO ACTIVITY ANALYSIS
-// =====================================================
-//
-// Uses FFmpeg astats to inspect short audio blocks.
-// This gives us:
-// - RMS
-// - peak
-// - zero crossing
-//
-// These values help identify voice-like activity.
-// =====================================================
+/* ======================================================
+   ROUND
+====================================================== */
 
-async function analyzeAudioActivity(
-  videoPath,
-  onProgress = null
+function round(
+  value,
+  digits = 3
 ) {
 
-  console.log("[VOICE] Running detailed audio activity analysis...");
-
-  return new Promise((resolve, reject) => {
-
-    const args = [
-      "-hide_banner",
-      "-i",
-      videoPath,
-
-      "-vn",
-
-      "-af",
-      "aresample=16000,astats=metadata=1:reset=0.5,ametadata=print:key=lavfi.astats.Overall.RMS_level",
-
-      "-f",
-      "null",
-      "-"
-    ];
-
-    const ffmpeg = spawn("ffmpeg", args);
-
-    let stderr = "";
-
-    ffmpeg.stderr.on("data", (data) => {
-
-      const text = data.toString();
-
-      stderr += text;
-
-      if (onProgress) {
-        onProgress();
-      }
-
-    });
-
-    ffmpeg.on("error", reject);
-
-    ffmpeg.on("close", (code) => {
-
-      if (code !== 0) {
-
-        reject(
-          new Error(
-            "Audio activity analysis failed.\n" +
-            stderr.slice(-4000)
-          )
-        );
-
-        return;
-      }
-
-      resolve({
-        raw: stderr
-      });
-
-    });
-
-  });
-
-}
-
-
-// =====================================================
-// BUILD ACTIVE SEGMENTS
-// =====================================================
-
-function buildActiveSegments(
-  events,
-  duration
-) {
-
-  const segments = [];
-
-  let active = true;
-  let activeStart = 0;
-
-  for (const event of events) {
-
-    if (
-      event.type === "start" &&
-      active
-    ) {
-
-      if (event.time > activeStart) {
-
-        segments.push({
-          start: activeStart,
-          end: Math.min(event.time, duration)
-        });
-
-      }
-
-      active = false;
-
-    }
-
-    else if (
-      event.type === "end" &&
-      !active
-    ) {
-
-      activeStart =
-        Math.max(0, event.time);
-
-      active = true;
-
-    }
-
-  }
-
-  if (active && activeStart < duration) {
-
-    segments.push({
-      start: activeStart,
-      end: duration
-    });
-
-  }
-
-  // Remove tiny segments
-
-  const filtered =
-    segments.filter(
-      s => (s.end - s.start) >= 0.20
+  const factor =
+    Math.pow(
+      10,
+      digits
     );
 
-  // Merge very small gaps
+  return Math.round(
+    safeNumber(value) *
+      factor
+  ) / factor;
+
+}
+
+
+/* ======================================================
+   CLAMP
+====================================================== */
+
+function clamp(
+  value,
+  min = 0,
+  max = 1
+) {
+
+  return Math.min(
+    max,
+    Math.max(
+      min,
+      safeNumber(value)
+    )
+  );
+
+}
+
+
+/* ======================================================
+   RUN COMMAND
+====================================================== */
+
+function runCommand(
+  command,
+  args = []
+) {
+
+  return new Promise(
+    (resolve, reject) => {
+
+      const child =
+        spawn(
+          command,
+          args,
+          {
+            stdio: [
+              "ignore",
+              "pipe",
+              "pipe"
+            ]
+          }
+        );
+
+
+      let stdout = "";
+
+      let stderr = "";
+
+
+      child.stdout.on(
+        "data",
+        data => {
+
+          stdout +=
+            data.toString();
+
+        }
+      );
+
+
+      child.stderr.on(
+        "data",
+        data => {
+
+          stderr +=
+            data.toString();
+
+        }
+      );
+
+
+      child.on(
+        "error",
+        error => {
+
+          reject(error);
+
+        }
+      );
+
+
+      child.on(
+        "close",
+        code => {
+
+          if (
+            code !== 0
+          ) {
+
+            const error =
+              new Error(
+                `${command} failed with exit code ${code}\n${stderr.slice(-6000)}`
+              );
+
+            error.code =
+              code;
+
+            error.stderr =
+              stderr;
+
+            error.stdout =
+              stdout;
+
+            reject(
+              error
+            );
+
+            return;
+
+          }
+
+
+          resolve({
+            stdout,
+            stderr
+          });
+
+        }
+      );
+
+    }
+  );
+
+}
+
+
+/* ======================================================
+   CHECK FFMPEG
+====================================================== */
+
+async function checkFFmpeg() {
+
+  try {
+
+    await runCommand(
+      "ffmpeg",
+      [
+        "-version"
+      ]
+    );
+
+    return true;
+
+  } catch (
+    error
+  ) {
+
+    throw new Error(
+      "FFmpeg is not available on the server."
+    );
+
+  }
+
+}
+
+
+/* ======================================================
+   EXTRACT AUDIO
+====================================================== */
+
+async function extractVoiceAudio(
+  videoPath
+) {
+
+  const tempName =
+    `${TEMP_PREFIX}-${crypto.randomUUID()}.wav`;
+
+
+  const wavPath =
+    path.join(
+      os.tmpdir(),
+      tempName
+    );
+
+
+  console.log("");
+  console.log(
+    "================================================"
+  );
+
+  console.log(
+    "🎤 VOICE ENGINE MAX V5"
+  );
+
+  console.log(
+    "AUDIO EXTRACTION"
+  );
+
+  console.log(
+    "INPUT:",
+    videoPath
+  );
+
+  console.log(
+    "OUTPUT:",
+    wavPath
+  );
+
+  console.log(
+    "================================================"
+  );
+
+
+  await checkFFmpeg();
+
+
+  const args = [
+
+    "-y",
+
+    "-hide_banner",
+
+    "-loglevel",
+    "error",
+
+    "-i",
+    videoPath,
+
+    "-vn",
+
+    "-ac",
+    "1",
+
+    "-ar",
+    String(
+      SAMPLE_RATE
+    ),
+
+    "-c:a",
+    "pcm_s16le",
+
+    wavPath
+
+  ];
+
+
+  await runCommand(
+    "ffmpeg",
+    args
+  );
+
+
+  if (
+    !fs.existsSync(
+      wavPath
+    )
+  ) {
+
+    throw new Error(
+      "Voice MAX audio extraction failed."
+    );
+
+  }
+
+
+  const stats =
+    fs.statSync(
+      wavPath
+    );
+
+
+  if (
+    stats.size < 1000
+  ) {
+
+    throw new Error(
+      "Extracted audio is empty or too small."
+    );
+
+  }
+
+
+  console.log(
+    "[VOICE MAX] WAV SIZE:",
+    (stats.size / 1024 / 1024)
+      .toFixed(2),
+    "MB"
+  );
+
+
+  return wavPath;
+
+}
+
+
+/* ======================================================
+   CLEAN TEMP FILE
+====================================================== */
+
+function cleanupTempAudio(
+  wavPath
+) {
+
+  if (
+    !wavPath
+  ) {
+
+    return;
+
+  }
+
+
+  try {
+
+    if (
+      fs.existsSync(
+        wavPath
+      )
+    ) {
+
+      fs.unlinkSync(
+        wavPath
+      );
+
+      console.log(
+        "[VOICE MAX] TEMP WAV DELETED"
+      );
+
+    }
+
+  } catch (
+    error
+  ) {
+
+    console.log(
+      "[VOICE MAX] CLEANUP ERROR:",
+      error.message
+    );
+
+  }
+
+}
+
+
+/* ======================================================
+   RUN ONE SILERO PROFILE
+====================================================== */
+
+async function runSileroProfile(
+  wavPath,
+  profile
+) {
+
+  console.log("");
+  console.log(
+    "----------------------------------------------"
+  );
+
+  console.log(
+    "[VOICE MAX] SILERO PROFILE:",
+    profile.name
+  );
+
+  console.log(
+    "[THRESHOLD]:",
+    profile.threshold
+  );
+
+  console.log(
+    "[HOLDOFF]:",
+    profile.holdoffMs
+  );
+
+  console.log(
+    "----------------------------------------------"
+  );
+
+
+  const file =
+    await DecibriFile.open(
+      wavPath,
+      {
+        sampleRate:
+          SAMPLE_RATE,
+
+        vad: {
+          model:
+            "silero",
+
+          threshold:
+            profile.threshold,
+
+          holdoffMs:
+            profile.holdoffMs
+        }
+      }
+    );
+
+
+  try {
+
+    const report =
+      await file.analyze();
+
+
+    if (
+      !report ||
+      !Array.isArray(
+        report.scores
+      ) ||
+      !Array.isArray(
+        report.segments
+      )
+    ) {
+
+      throw new Error(
+        `Invalid Silero report for ${profile.name} profile.`
+      );
+
+    }
+
+
+    console.log(
+      `[VOICE MAX] ${profile.name} windows:`,
+      report.scores.length
+    );
+
+
+    console.log(
+      `[VOICE MAX] ${profile.name} segments:`,
+      report.segments.length
+    );
+
+
+    return {
+
+      profile:
+        profile.name,
+
+      threshold:
+        profile.threshold,
+
+      holdoffMs:
+        profile.holdoffMs,
+
+      scores:
+        report.scores,
+
+      segments:
+        report.segments
+
+    };
+
+  } finally {
+
+    try {
+
+      file.close();
+
+    } catch (_) {}
+
+  }
+
+}
+
+
+/* ======================================================
+   NORMALIZE SEGMENTS
+====================================================== */
+
+function normalizeSegments(
+  segments,
+  videoDuration
+) {
+
+  const normalized = [];
+
+
+  for (
+    const segment of
+    segments || []
+  ) {
+
+    let start =
+      safeNumber(
+        segment.start
+      );
+
+    let end =
+      safeNumber(
+        segment.end
+      );
+
+
+    start =
+      Math.max(
+        0,
+        start
+      );
+
+
+    end =
+      Math.min(
+        videoDuration,
+        end
+      );
+
+
+    if (
+      end <= start
+    ) {
+
+      continue;
+
+    }
+
+
+    const duration =
+      end -
+      start;
+
+
+    if (
+      duration <
+      MIN_SPEECH_DURATION
+    ) {
+
+      continue;
+
+    }
+
+
+    normalized.push({
+
+      start,
+
+      end,
+
+      duration
+
+    });
+
+  }
+
+
+  normalized.sort(
+    (a, b) =>
+      a.start -
+      b.start
+  );
+
+
+  return normalized;
+
+}
+
+
+/* ======================================================
+   MERGE SEGMENTS
+====================================================== */
+
+function mergeSegments(
+  segments,
+  maxGap = SEGMENT_GAP
+) {
+
+  if (
+    !segments ||
+    segments.length === 0
+  ) {
+
+    return [];
+
+  }
+
+
+  const sorted =
+    [...segments].sort(
+      (a, b) =>
+        a.start -
+        b.start
+    );
+
 
   const merged = [];
 
-  for (const segment of filtered) {
 
-    const previous =
-      merged[merged.length - 1];
+  for (
+    const segment of sorted
+  ) {
 
     if (
-      previous &&
-      segment.start - previous.end <= 0.30
+      merged.length === 0
+    ) {
+
+      merged.push({
+
+        start:
+          segment.start,
+
+        end:
+          segment.end
+
+      });
+
+      continue;
+
+    }
+
+
+    const previous =
+      merged[
+        merged.length - 1
+      ];
+
+
+    if (
+      segment.start -
+        previous.end
+      <= maxGap
     ) {
 
       previous.end =
@@ -350,24 +819,90 @@ function buildActiveSegments(
     } else {
 
       merged.push({
-        start: segment.start,
-        end: segment.end
+
+        start:
+          segment.start,
+
+        end:
+          segment.end
+
       });
 
     }
 
   }
 
-  return merged;
+
+  return merged.map(
+    segment => ({
+
+      start:
+        round(
+          segment.start
+        ),
+
+      end:
+        round(
+          segment.end
+        ),
+
+      duration:
+        round(
+          segment.end -
+          segment.start
+        )
+
+    })
+  );
 
 }
 
 
-// =====================================================
-// CALCULATE ACTIVE TIME
-// =====================================================
+/* ======================================================
+   GET OVERLAP
+====================================================== */
 
-function calculateActiveTime(
+function getOverlap(
+  aStart,
+  aEnd,
+  bStart,
+  bEnd
+) {
+
+  const start =
+    Math.max(
+      aStart,
+      bStart
+    );
+
+
+  const end =
+    Math.min(
+      aEnd,
+      bEnd
+    );
+
+
+  if (
+    end <= start
+  ) {
+
+    return 0;
+
+  }
+
+
+  return end -
+    start;
+
+}
+
+
+/* ======================================================
+   SPEECH TIME
+====================================================== */
+
+function calculateSpeechTime(
   segments,
   start,
   end
@@ -375,31 +910,604 @@ function calculateActiveTime(
 
   let total = 0;
 
-  for (const segment of segments) {
+
+  for (
+    const segment of
+    segments
+  ) {
+
+    if (
+      segment.end <= start
+    ) {
+
+      continue;
+
+    }
+
+
+    if (
+      segment.start >= end
+    ) {
+
+      break;
+
+    }
+
+
+    total +=
+      getOverlap(
+        start,
+        end,
+        segment.start,
+        segment.end
+      );
+
+  }
+
+
+  return clamp(
+    total,
+    0,
+    end - start
+  );
+
+}
+
+
+/* ======================================================
+   WINDOW SEGMENTS
+====================================================== */
+
+function getWindowSegments(
+  segments,
+  start,
+  end
+) {
+
+  const result = [];
+
+
+  for (
+    const segment of
+    segments
+  ) {
+
+    if (
+      segment.end <= start
+    ) {
+
+      continue;
+
+    }
+
+
+    if (
+      segment.start >= end
+    ) {
+
+      break;
+
+    }
+
 
     const overlapStart =
-      Math.max(start, segment.start);
+      Math.max(
+        start,
+        segment.start
+      );
+
 
     const overlapEnd =
-      Math.min(end, segment.end);
+      Math.min(
+        end,
+        segment.end
+      );
 
-    if (overlapEnd > overlapStart) {
 
-      total +=
-        overlapEnd - overlapStart;
+    if (
+      overlapEnd >
+      overlapStart
+    ) {
+
+      result.push({
+
+        start:
+          overlapStart,
+
+        end:
+          overlapEnd,
+
+        duration:
+          overlapEnd -
+          overlapStart
+
+      });
 
     }
 
   }
 
-  return total;
+
+  return result;
 
 }
 
 
-// =====================================================
-// CALCULATE VOICE CONTINUITY
-// =====================================================
+/* ======================================================
+   AVERAGE VAD
+====================================================== */
+
+function calculateAverageVad(
+  scores,
+  start,
+  end
+) {
+
+  let weighted =
+    0;
+
+  let duration =
+    0;
+
+
+  for (
+    const item of
+    scores || []
+  ) {
+
+    const itemStart =
+      safeNumber(
+        item.start
+      );
+
+
+    const itemEnd =
+      safeNumber(
+        item.end
+      );
+
+
+    if (
+      itemEnd <= start
+    ) {
+
+      continue;
+
+    }
+
+
+    if (
+      itemStart >= end
+    ) {
+
+      break;
+
+    }
+
+
+    const overlap =
+      getOverlap(
+        start,
+        end,
+        itemStart,
+        itemEnd
+      );
+
+
+    if (
+      overlap <= 0
+    ) {
+
+      continue;
+
+    }
+
+
+    const vad =
+      clamp(
+        safeNumber(
+          item.vadScore
+        )
+      );
+
+
+    weighted +=
+      vad *
+      overlap;
+
+
+    duration +=
+      overlap;
+
+  }
+
+
+  if (
+    duration <= 0
+  ) {
+
+    return 0;
+
+  }
+
+
+  return clamp(
+    weighted /
+      duration
+  );
+
+}
+
+
+/* ======================================================
+   PEAK VAD
+====================================================== */
+
+function calculatePeakVad(
+  scores,
+  start,
+  end
+) {
+
+  let peak = 0;
+
+
+  for (
+    const item of
+    scores || []
+  ) {
+
+    const itemStart =
+      safeNumber(
+        item.start
+      );
+
+
+    const itemEnd =
+      safeNumber(
+        item.end
+      );
+
+
+    if (
+      itemEnd <= start
+    ) {
+
+      continue;
+
+    }
+
+
+    if (
+      itemStart >= end
+    ) {
+
+      break;
+
+    }
+
+
+    const overlap =
+      getOverlap(
+        start,
+        end,
+        itemStart,
+        itemEnd
+      );
+
+
+    if (
+      overlap <= 0
+    ) {
+
+      continue;
+
+    }
+
+
+    peak =
+      Math.max(
+        peak,
+        clamp(
+          safeNumber(
+            item.vadScore
+          )
+        )
+      );
+
+  }
+
+
+  return peak;
+
+}
+
+
+/* ======================================================
+   MIN VAD
+====================================================== */
+
+function calculateMinimumVad(
+  scores,
+  start,
+  end
+) {
+
+  let minimum =
+    1;
+
+  let found = false;
+
+
+  for (
+    const item of
+    scores || []
+  ) {
+
+    const itemStart =
+      safeNumber(
+        item.start
+      );
+
+
+    const itemEnd =
+      safeNumber(
+        item.end
+      );
+
+
+    if (
+      itemEnd <= start
+    ) {
+
+      continue;
+
+    }
+
+
+    if (
+      itemStart >= end
+    ) {
+
+      break;
+
+    }
+
+
+    const overlap =
+      getOverlap(
+        start,
+        end,
+        itemStart,
+        itemEnd
+      );
+
+
+    if (
+      overlap <= 0
+    ) {
+
+      continue;
+
+    }
+
+
+    minimum =
+      Math.min(
+        minimum,
+        clamp(
+          safeNumber(
+            item.vadScore
+          )
+        )
+      );
+
+
+    found = true;
+
+  }
+
+
+  if (
+    !found
+  ) {
+
+    return 0;
+
+  }
+
+
+  return minimum;
+
+}
+
+
+/* ======================================================
+   VAD STABILITY
+====================================================== */
+
+function calculateVadStability(
+  scores,
+  start,
+  end
+) {
+
+  let values = [];
+
+
+  for (
+    const item of
+    scores || []
+  ) {
+
+    const itemStart =
+      safeNumber(
+        item.start
+      );
+
+
+    const itemEnd =
+      safeNumber(
+        item.end
+      );
+
+
+    if (
+      itemEnd <= start
+    ) {
+
+      continue;
+
+    }
+
+
+    if (
+      itemStart >= end
+    ) {
+
+      break;
+
+    }
+
+
+    const overlap =
+      getOverlap(
+        start,
+        end,
+        itemStart,
+        itemEnd
+      );
+
+
+    if (
+      overlap <= 0
+    ) {
+
+      continue;
+
+    }
+
+
+    values.push(
+      clamp(
+        safeNumber(
+          item.vadScore
+        )
+      )
+    );
+
+  }
+
+
+  if (
+    values.length < 2
+  ) {
+
+    return values.length
+      ? values[0]
+      : 0;
+
+  }
+
+
+  const mean =
+    values.reduce(
+      (sum, value) =>
+        sum + value,
+      0
+    ) /
+    values.length;
+
+
+  let variance = 0;
+
+
+  for (
+    const value of values
+  ) {
+
+    variance +=
+      Math.pow(
+        value - mean,
+        2
+      );
+
+  }
+
+
+  variance /=
+    values.length;
+
+
+  const standardDeviation =
+    Math.sqrt(
+      variance
+    );
+
+
+  return clamp(
+    1 -
+      standardDeviation
+  );
+
+}
+
+
+/* ======================================================
+   START STRENGTH
+====================================================== */
+
+function calculateStartStrength(
+  scores,
+  start,
+  end
+) {
+
+  const rangeEnd =
+    Math.min(
+      end,
+      start + 3
+    );
+
+
+  return calculateAverageVad(
+    scores,
+    start,
+    rangeEnd
+  );
+
+}
+
+
+/* ======================================================
+   END STRENGTH
+====================================================== */
+
+function calculateEndStrength(
+  scores,
+  start,
+  end
+) {
+
+  const rangeStart =
+    Math.max(
+      start,
+      end - 3
+    );
+
+
+  return calculateAverageVad(
+    scores,
+    rangeStart,
+    end
+  );
+
+}
+
+
+/* ======================================================
+   CONTINUITY
+====================================================== */
 
 function calculateContinuity(
   segments,
@@ -407,281 +1515,1188 @@ function calculateContinuity(
   end
 ) {
 
-  const relevant =
-    segments.filter(
-      s =>
-        s.end > start &&
-        s.start < end
+  const duration =
+    end - start;
+
+
+  if (
+    duration <= 0
+  ) {
+
+    return 0;
+
+  }
+
+
+  if (
+    segments.length === 0
+  ) {
+
+    return 0;
+
+  }
+
+
+  let covered = 0;
+
+
+  for (
+    const segment of
+    segments
+  ) {
+
+    covered +=
+      getOverlap(
+        start,
+        end,
+        segment.start,
+        segment.end
+      );
+
+  }
+
+
+  const coverage =
+    clamp(
+      covered /
+        duration
     );
 
-  if (!relevant.length) {
-    return 0;
-  }
 
-  let longest = 0;
+  const gaps =
+    Math.max(
+      0,
+      segments.length - 1
+    );
 
-  for (const segment of relevant) {
 
-    const a =
-      Math.max(start, segment.start);
+  const gapPenalty =
+    Math.min(
+      0.30,
+      gaps * 0.02
+    );
 
-    const b =
-      Math.min(end, segment.end);
 
-    if (b > a) {
-
-      longest =
-        Math.max(
-          longest,
-          b - a
-        );
-
-    }
-
-  }
-
-  return Math.min(
-    1,
-    longest / 30
+  return clamp(
+    coverage -
+      gapPenalty
   );
 
 }
 
 
-// =====================================================
-// VOICE CANDIDATE GENERATOR
-// =====================================================
+/* ======================================================
+   SPEECH DENSITY
+====================================================== */
 
-function createVoiceCandidates(
+function calculateSpeechDensity(
   segments,
-  duration,
-  audioInfo = {}
+  start,
+  end
 ) {
 
-  const candidates = [];
+  const windowDuration =
+    end - start;
 
-  const windowSize = 30;
 
-  const step = 5;
+  if (
+    windowDuration <= 0
+  ) {
 
-  const meanVolume =
-    Number.isFinite(audioInfo.meanVolume)
-      ? audioInfo.meanVolume
-      : -35;
+    return 0;
 
-  const maxVolume =
-    Number.isFinite(audioInfo.maxVolume)
-      ? audioInfo.maxVolume
-      : -10;
+  }
+
+
+  let weighted = 0;
 
 
   for (
-    let start = 0;
-    start < duration;
-    start += step
+    const segment of
+    segments
   ) {
 
-    const end =
-      Math.min(
-        start + windowSize,
-        duration
+    const overlap =
+      getOverlap(
+        start,
+        end,
+        segment.start,
+        segment.end
       );
 
-    const actualDuration =
-      end - start;
 
-    if (actualDuration < 10) {
+    if (
+      overlap > 0
+    ) {
+
+      weighted +=
+        overlap;
+
+    }
+
+  }
+
+
+  return clamp(
+    weighted /
+      windowDuration
+  );
+
+}
+
+
+/* ======================================================
+   SPEECH EVENT COUNT
+====================================================== */
+
+function countSpeechEvents(
+  segments,
+  start,
+  end
+) {
+
+  let count = 0;
+
+
+  for (
+    const segment of
+    segments
+  ) {
+
+    if (
+      segment.end <= start
+    ) {
+
       continue;
+
     }
 
-    const activeTime =
-      calculateActiveTime(
-        segments,
-        start,
-        end
-      );
-
-    const activePercent =
-      (activeTime / actualDuration) * 100;
-
-    const continuity =
-      calculateContinuity(
-        segments,
-        start,
-        end
-      );
-
-
-    // ===============================================
-    // VOICE SCORE
-    // ===============================================
-
-    let score = 0;
-
-
-    // Main activity score
-
-    score +=
-      Math.min(
-        60,
-        activePercent * 0.60
-      );
-
-
-    // Ideal speech activity
 
     if (
-      activePercent >= 35 &&
-      activePercent <= 95
+      segment.start >= end
     ) {
 
-      score += 20;
+      break;
 
     }
 
-
-    // Strong continuous voice region
 
     if (
-      activePercent >= 55 &&
-      activePercent <= 90
+      getOverlap(
+        start,
+        end,
+        segment.start,
+        segment.end
+      ) > 0
     ) {
 
-      score += 12;
+      count++;
 
     }
 
-
-    // Continuity
-
-    score +=
-      continuity * 12;
+  }
 
 
-    // Too much silence
+  return count;
 
-    if (activePercent < 15) {
-
-      score -= 25;
-
-    }
+}
 
 
-    // Almost 100% active can be music/noise
+/* ======================================================
+   CONSENSUS SCORE
+====================================================== */
 
-    if (activePercent > 98) {
+function calculateConsensus(
+  sensitive,
+  balanced,
+  strict
+) {
 
-      score -= 8;
+  /*
+  Sensitive catches quiet speech.
+  Balanced is the main signal.
+  Strict confirms stronger speech.
 
-    }
-
-
-    // ===============================================
-    // LOUDNESS BONUS
-    // ===============================================
-
-    if (meanVolume > -30) {
-
-      score += 4;
-
-    }
-
-    if (maxVolume > -6) {
-
-      score += 3;
-
-    }
+  We don't require strict speech everywhere,
+  otherwise quiet human speech could be lost.
+  */
 
 
-    // ===============================================
-    // SCORE LIMIT
-    // ===============================================
+  const score =
+    (
+      sensitive * 0.25
+      +
+      balanced * 0.50
+      +
+      strict * 0.25
+    );
 
-    score =
-      Math.max(
-        0,
+
+  return clamp(
+    score
+  );
+
+}
+
+
+/* ======================================================
+   BUILD CONSENSUS SEGMENTS
+====================================================== */
+
+function buildConsensusSegments(
+  profileReports,
+  videoDuration
+) {
+
+  const sensitive =
+    profileReports
+      .sensitive
+      .segments;
+
+
+  const balanced =
+    profileReports
+      .balanced
+      .segments;
+
+
+  const strict =
+    profileReports
+      .strict
+      .segments;
+
+
+  const normalizedSensitive =
+    normalizeSegments(
+      sensitive,
+      videoDuration
+    );
+
+
+  const normalizedBalanced =
+    normalizeSegments(
+      balanced,
+      videoDuration
+    );
+
+
+  const normalizedStrict =
+    normalizeSegments(
+      strict,
+      videoDuration
+    );
+
+
+  /*
+  Main speech source:
+  balanced profile.
+  */
+
+  let base =
+    normalizedBalanced;
+
+
+  /*
+  If balanced finds nothing but
+  sensitive finds speech, use sensitive.
+  */
+
+  if (
+    base.length === 0
+    &&
+    normalizedSensitive.length > 0
+  ) {
+
+    base =
+      normalizedSensitive;
+
+  }
+
+
+  /*
+  Build expanded intervals from
+  sensitive detection around the
+  balanced speech.
+
+  This prevents tiny VAD gaps from
+  destroying one continuous sentence.
+  */
+
+  const expanded = [];
+
+
+  for (
+    const segment of
+    base
+  ) {
+
+    const nearby =
+      normalizedSensitive
+        .filter(
+          candidate =>
+            candidate.end >
+              segment.start -
+              0.35
+            &&
+            candidate.start <
+              segment.end +
+              0.35
+        );
+
+
+    let start =
+      segment.start;
+
+
+    let end =
+      segment.end;
+
+
+    for (
+      const candidate of
+      nearby
+    ) {
+
+      start =
         Math.min(
-          100,
-          score
-        )
-      );
+          start,
+          candidate.start
+        );
 
 
-    candidates.push({
+      end =
+        Math.max(
+          end,
+          candidate.end
+        );
+
+    }
+
+
+    expanded.push({
 
       start,
 
-      end,
-
-      duration: actualDuration,
-
-      activeTime,
-
-      activePercent,
-
-      continuity,
-
-      score,
-
-      meanVolume,
-
-      maxVolume
+      end
 
     });
 
   }
 
 
-  candidates.sort(
-    (a, b) =>
-      b.score - a.score
+  const merged =
+    mergeSegments(
+      expanded,
+      0.45
+    );
+
+
+  /*
+  Attach confidence metadata.
+  */
+
+  return merged.map(
+    segment => {
+
+      const segmentStart =
+        segment.start;
+
+
+      const segmentEnd =
+        segment.end;
+
+
+      const sensitiveTime =
+        calculateSpeechTime(
+          normalizedSensitive,
+          segmentStart,
+          segmentEnd
+        );
+
+
+      const balancedTime =
+        calculateSpeechTime(
+          normalizedBalanced,
+          segmentStart,
+          segmentEnd
+        );
+
+
+      const strictTime =
+        calculateSpeechTime(
+          normalizedStrict,
+          segmentStart,
+          segmentEnd
+        );
+
+
+      const duration =
+        segmentEnd -
+        segmentStart;
+
+
+      const sensitiveCoverage =
+        duration > 0
+          ? sensitiveTime /
+            duration
+          : 0;
+
+
+      const balancedCoverage =
+        duration > 0
+          ? balancedTime /
+            duration
+          : 0;
+
+
+      const strictCoverage =
+        duration > 0
+          ? strictTime /
+            duration
+          : 0;
+
+
+      const consensus =
+        calculateConsensus(
+          sensitiveCoverage,
+          balancedCoverage,
+          strictCoverage
+        );
+
+
+      return {
+
+        start:
+          round(
+            segmentStart
+          ),
+
+        end:
+          round(
+            segmentEnd
+          ),
+
+        duration:
+          round(
+            duration
+          ),
+
+        sensitiveCoverage:
+          round(
+            sensitiveCoverage,
+            4
+          ),
+
+        balancedCoverage:
+          round(
+            balancedCoverage,
+            4
+          ),
+
+        strictCoverage:
+          round(
+            strictCoverage,
+            4
+          ),
+
+        consensus:
+          round(
+            consensus,
+            4
+          )
+
+      };
+
+    }
   );
+
+}
+
+
+/* ======================================================
+   CALCULATE VOICE SCORE
+====================================================== */
+
+function calculateVoiceScore(
+  speechCoverage,
+  averageVad,
+  peakVad,
+  continuity,
+  density,
+  stability,
+  consensus,
+  startStrength,
+  endStrength,
+  eventCount
+) {
+
+  /*
+  ------------------------------------------------------
+  MAX VOICE SCORE
+
+  Speech coverage       35
+  Average VAD           20
+  Consensus              12
+  Continuity              8
+  Density                 6
+  Peak                    5
+  Stability               5
+  Start strength          3
+  End strength            3
+  Event quality            3
+  ------------------------------------------------------
+
+  TOTAL = 100
+  ------------------------------------------------------
+  */
+
+
+  const coverageScore =
+    clamp(
+      speechCoverage
+    ) * 35;
+
+
+  const averageScore =
+    clamp(
+      averageVad
+    ) * 20;
+
+
+  const consensusScore =
+    clamp(
+      consensus
+    ) * 12;
+
+
+  const continuityScore =
+    clamp(
+      continuity
+    ) * 8;
+
+
+  const densityScore =
+    clamp(
+      density
+    ) * 6;
+
+
+  const peakScore =
+    clamp(
+      peakVad
+    ) * 5;
+
+
+  const stabilityScore =
+    clamp(
+      stability
+    ) * 5;
+
+
+  const startScore =
+    clamp(
+      startStrength
+    ) * 3;
+
+
+  const endScore =
+    clamp(
+      endStrength
+    ) * 3;
+
+
+  /*
+  Prefer a healthy number of
+  speech events.
+
+  Too few = possibly noise/long tone.
+  Too many = possibly fragmented/noisy.
+  */
+
+  let eventQuality = 0;
+
+
+  if (
+    eventCount >= 1 &&
+    eventCount <= 12
+  ) {
+
+    eventQuality = 1;
+
+  } else if (
+    eventCount > 12 &&
+    eventCount <= 20
+  ) {
+
+    eventQuality = 0.75;
+
+  } else if (
+    eventCount > 20
+  ) {
+
+    eventQuality = 0.50;
+
+  }
+
+
+  const eventScore =
+    eventQuality * 3;
+
+
+  const rawScore =
+    coverageScore
+    +
+    averageScore
+    +
+    consensusScore
+    +
+    continuityScore
+    +
+    densityScore
+    +
+    peakScore
+    +
+    stabilityScore
+    +
+    startScore
+    +
+    endScore
+    +
+    eventScore;
+
+
+  return round(
+    clamp(
+      rawScore / 100
+    ) * 100,
+    2
+  );
+
+}
+
+
+/* ======================================================
+   SCORE CANDIDATE
+====================================================== */
+
+function scoreCandidate(
+  start,
+  end,
+  speechSegments,
+  balancedScores,
+  sensitiveScores,
+  strictScores
+) {
+
+  const duration =
+    end -
+    start;
+
+
+  if (
+    duration <= 0
+  ) {
+
+    return null;
+
+  }
+
+
+  const windowSegments =
+    getWindowSegments(
+      speechSegments,
+      start,
+      end
+    );
+
+
+  const activeTime =
+    calculateSpeechTime(
+      speechSegments,
+      start,
+      end
+    );
+
+
+  const speechCoverage =
+    clamp(
+      activeTime /
+        duration
+    );
+
+
+  const averageVad =
+    calculateAverageVad(
+      balancedScores,
+      start,
+      end
+    );
+
+
+  const peakVad =
+    calculatePeakVad(
+      balancedScores,
+      start,
+      end
+    );
+
+
+  const minimumVad =
+    calculateMinimumVad(
+      balancedScores,
+      start,
+      end
+    );
+
+
+  const stability =
+    calculateVadStability(
+      balancedScores,
+      start,
+      end
+    );
+
+
+  const continuity =
+    calculateContinuity(
+      windowSegments,
+      start,
+      end
+    );
+
+
+  const density =
+    calculateSpeechDensity(
+      speechSegments,
+      start,
+      end
+    );
+
+
+  const startStrength =
+    calculateStartStrength(
+      balancedScores,
+      start,
+      end
+    );
+
+
+  const endStrength =
+    calculateEndStrength(
+      balancedScores,
+      start,
+      end
+    );
+
+
+  const sensitiveCoverage =
+    clamp(
+      calculateSpeechTime(
+        speechSegments,
+        start,
+        end
+      ) /
+      duration
+    );
+
+
+  /*
+  Strict and sensitive are recalculated
+  using their own score arrays.
+  */
+
+  const sensitiveAverage =
+    calculateAverageVad(
+      sensitiveScores,
+      start,
+      end
+    );
+
+
+  const strictAverage =
+    calculateAverageVad(
+      strictScores,
+      start,
+      end
+    );
+
+
+  const consensus =
+    calculateConsensus(
+      sensitiveAverage,
+      averageVad,
+      strictAverage
+    );
+
+
+  const eventCount =
+    countSpeechEvents(
+      windowSegments,
+      start,
+      end
+    );
+
+
+  const score =
+    calculateVoiceScore(
+      speechCoverage,
+      averageVad,
+      peakVad,
+      continuity,
+      density,
+      stability,
+      consensus,
+      startStrength,
+      endStrength,
+      eventCount
+    );
+
+
+  return {
+
+    start:
+      round(
+        start
+      ),
+
+    end:
+      round(
+        end
+      ),
+
+    duration:
+      round(
+        duration
+      ),
+
+    activeTime:
+      round(
+        activeTime
+      ),
+
+    activePercent:
+      round(
+        speechCoverage * 100,
+        2
+      ),
+
+    averageVad:
+      round(
+        averageVad,
+        4
+      ),
+
+    peakVad:
+      round(
+        peakVad,
+        4
+      ),
+
+    minimumVad:
+      round(
+        minimumVad,
+        4
+      ),
+
+    vadStability:
+      round(
+        stability,
+        4
+      ),
+
+    continuity:
+      round(
+        continuity,
+        4
+      ),
+
+    speechDensity:
+      round(
+        density,
+        4
+      ),
+
+    consensus:
+      round(
+        consensus,
+        4
+      ),
+
+    startStrength:
+      round(
+        startStrength,
+        4
+      ),
+
+    endStrength:
+      round(
+        endStrength,
+        4
+      ),
+
+    speechSegments:
+      eventCount,
+
+    score
+
+  };
+
+}
+
+
+/* ======================================================
+   CREATE 30 SECOND CANDIDATES
+====================================================== */
+
+function createVoiceCandidates(
+  speechSegments,
+  reports,
+  duration
+) {
+
+  const candidates = [];
+
+
+  if (
+    duration <= 0
+  ) {
+
+    return candidates;
+
+  }
+
+
+  const clipLength =
+    Math.min(
+      CLIP_DURATION,
+      duration
+    );
+
+
+  const maxStart =
+    Math.max(
+      0,
+      duration -
+        clipLength
+    );
+
+
+  const balancedScores =
+    reports
+      .balanced
+      .scores;
+
+
+  const sensitiveScores =
+    reports
+      .sensitive
+      .scores;
+
+
+  const strictScores =
+    reports
+      .strict
+      .scores;
+
+
+  /*
+  ------------------------------------------------------
+  NORMAL SLIDING WINDOW
+  ------------------------------------------------------
+  */
+
+  for (
+    let start = 0;
+    start <= maxStart;
+    start += WINDOW_STEP
+  ) {
+
+    const end =
+      Math.min(
+        duration,
+        start +
+          clipLength
+      );
+
+
+    const candidate =
+      scoreCandidate(
+        start,
+        end,
+        speechSegments,
+        balancedScores,
+        sensitiveScores,
+        strictScores
+      );
+
+
+    if (
+      candidate
+    ) {
+
+      candidates.push(
+        candidate
+      );
+
+    }
+
+  }
+
+
+  /*
+  ------------------------------------------------------
+  ALWAYS TEST FINAL WINDOW
+  ------------------------------------------------------
+  */
+
+  if (
+    maxStart > 0
+  ) {
+
+    const exists =
+      candidates.some(
+        candidate =>
+          Math.abs(
+            candidate.start -
+            maxStart
+          ) < 0.01
+      );
+
+
+    if (
+      !exists
+    ) {
+
+      const finalCandidate =
+        scoreCandidate(
+          maxStart,
+          maxStart +
+            clipLength,
+          speechSegments,
+          balancedScores,
+          sensitiveScores,
+          strictScores
+        );
+
+
+      if (
+        finalCandidate
+      ) {
+
+        candidates.push(
+          finalCandidate
+        );
+
+      }
+
+    }
+
+  }
+
+
+  /*
+  ------------------------------------------------------
+  SHORT VIDEO
+  ------------------------------------------------------
+  */
+
+  if (
+    candidates.length === 0
+  ) {
+
+    const candidate =
+      scoreCandidate(
+        0,
+        clipLength,
+        speechSegments,
+        balancedScores,
+        sensitiveScores,
+        strictScores
+      );
+
+
+    if (
+      candidate
+    ) {
+
+      candidates.push(
+        candidate
+      );
+
+    }
+
+  }
+
 
   return candidates;
 
 }
 
 
-// =====================================================
-// SEPARATE TOP RESULTS
-// =====================================================
+/* ======================================================
+   TOP SEPARATED
+====================================================== */
 
 function getTopSeparated(
   candidates,
-  count = 10,
-  minimumDistance = 20
+  limit = TOP_LIMIT,
+  separation =
+    SEPARATION_SECONDS
 ) {
+
+  const sorted =
+    [...candidates].sort(
+      (a, b) =>
+        b.score -
+        a.score
+    );
+
 
   const selected = [];
 
-  for (const candidate of candidates) {
 
-    let tooClose = false;
+  for (
+    const candidate of
+    sorted
+  ) {
 
-    for (const existing of selected) {
+    const tooClose =
+      selected.some(
+        existing => {
 
-      if (
-        Math.abs(
-          candidate.start -
-          existing.start
-        ) < minimumDistance
-      ) {
+          const distance =
+            Math.abs(
+              candidate.start -
+              existing.start
+            );
 
-        tooClose = true;
-        break;
 
-      }
+          return (
+            distance <
+            separation
+          );
 
-    }
+        }
+      );
 
-    if (!tooClose) {
-
-      selected.push(candidate);
-
-    }
 
     if (
-      selected.length >= count
+      tooClose
+    ) {
+
+      continue;
+
+    }
+
+
+    selected.push(
+      candidate
+    );
+
+
+    if (
+      selected.length >=
+      limit
     ) {
 
       break;
@@ -690,235 +2705,559 @@ function getTopSeparated(
 
   }
 
+
   return selected;
 
 }
 
 
-// =====================================================
-// MAIN VOICE ANALYZER
-// =====================================================
+/* ======================================================
+   ANALYZE VOICE
+====================================================== */
 
 async function analyzeVoice(
   videoPath,
   duration,
-  onProgress = null
+  progressCallback
 ) {
 
-  if (!fs.existsSync(videoPath)) {
-
-    throw new Error(
-      "Video file does not exist."
+  const videoDuration =
+    Math.max(
+      0,
+      safeNumber(
+        duration
+      )
     );
 
-  }
+
+  console.log("");
+  console.log(
+    "======================================================"
+  );
+
+  console.log(
+    "🎤 VOICE ENGINE MAX V5"
+  );
+
+  console.log(
+    "MULTI-PASS SILERO SPEECH ANALYSIS"
+  );
+
+  console.log(
+    "VIDEO DURATION:",
+    videoDuration,
+    "seconds"
+  );
+
+  console.log(
+    "======================================================"
+  );
+
 
   if (
-    !Number.isFinite(duration) ||
-    duration <= 0
+    typeof progressCallback ===
+    "function"
   ) {
 
-    throw new Error(
-      "Invalid video duration."
+    progressCallback(
+      5
     );
 
   }
 
 
-  console.log("");
-  console.log(
-    "======================================"
-  );
-
-  console.log(
-    "[MAX VOICE ENGINE V3]"
-  );
-
-  console.log(
-    "[VIDEO]",
-    videoPath
-  );
-
-  console.log(
-    "[DURATION]",
-    duration
-  );
-
-  console.log(
-    "======================================"
-  );
+  let wavPath =
+    null;
 
 
-  // ===============================================
-  // STEP 1 — AUDIO INFO
-  // ===============================================
+  try {
 
-  if (onProgress) {
-    onProgress(15, "Reading audio...");
-  }
+    /*
+    ====================================================
+    STEP 1
+    ====================================================
+    */
 
-  const audioInfo =
-    await getAudioInfo(videoPath);
+    wavPath =
+      await extractVoiceAudio(
+        videoPath
+      );
 
 
-  // ===============================================
-  // STEP 2 — SILENCE
-  // ===============================================
+    if (
+      typeof progressCallback ===
+      "function"
+    ) {
 
-  if (onProgress) {
-    onProgress(35, "Detecting voice activity...");
-  }
+      progressCallback(
+        20
+      );
 
-  const silenceEvents =
-    await detectSilence(
-      videoPath,
-      -38,
-      0.25
+    }
+
+
+    /*
+    ====================================================
+    STEP 2
+    MULTI-PASS SILERO
+    ====================================================
+    */
+
+    const reports = {};
+
+
+    for (
+      let i = 0;
+      i <
+      VAD_PROFILES.length;
+      i++
+    ) {
+
+      const profile =
+        VAD_PROFILES[i];
+
+
+      const result =
+        await runSileroProfile(
+          wavPath,
+          profile
+        );
+
+
+      reports[
+        profile.name
+      ] =
+        result;
+
+
+      const progress =
+        20 +
+        (
+          ((i + 1) /
+            VAD_PROFILES.length)
+          * 40
+        );
+
+
+      if (
+        typeof progressCallback ===
+        "function"
+      ) {
+
+        progressCallback(
+          Math.round(
+            progress
+          )
+        );
+
+      }
+
+    }
+
+
+    /*
+    ====================================================
+    STEP 3
+    BUILD SPEECH CONSENSUS
+    ====================================================
+    */
+
+    const speechSegments =
+      buildConsensusSegments(
+        reports,
+        videoDuration
+      );
+
+
+    console.log("");
+    console.log(
+      "[VOICE MAX] CONSENSUS SEGMENTS:",
+      speechSegments.length
     );
 
 
-  // ===============================================
-  // STEP 3 — ACTIVE SEGMENTS
-  // ===============================================
+    const totalSpeechTime =
+      speechSegments.reduce(
+        (
+          total,
+          segment
+        ) =>
+          total +
+          segment.duration,
+        0
+      );
 
-  if (onProgress) {
-    onProgress(55, "Building active voice segments...");
-  }
 
-  const segments =
-    buildActiveSegments(
-      silenceEvents,
-      duration
+    /*
+    ====================================================
+    STEP 4
+    CREATE CANDIDATES
+    ====================================================
+    */
+
+    if (
+      typeof progressCallback ===
+      "function"
+    ) {
+
+      progressCallback(
+        70
+      );
+
+    }
+
+
+    const candidates =
+      createVoiceCandidates(
+        speechSegments,
+        reports,
+        videoDuration
+      );
+
+
+    console.log(
+      "[VOICE MAX] CANDIDATES:",
+      candidates.length
     );
 
 
-  // ===============================================
-  // STEP 4 — DETAILED AUDIO
-  // ===============================================
+    /*
+    ====================================================
+    STEP 5
+    TOP 10
+    ====================================================
+    */
 
-  if (onProgress) {
-    onProgress(70, "Checking detailed audio activity...");
-  }
+    const top =
+      getTopSeparated(
+        candidates,
+        TOP_LIMIT,
+        SEPARATION_SECONDS
+      );
 
-  await analyzeAudioActivity(
-    videoPath
-  );
+
+    /*
+    ====================================================
+    STEP 6
+    BEST
+    ====================================================
+    */
+
+    let best =
+      null;
 
 
-  // ===============================================
-  // STEP 5 — CANDIDATES
-  // ===============================================
+    if (
+      top.length > 0
+    ) {
 
-  if (onProgress) {
-    onProgress(85, "Finding best voice moments...");
-  }
+      best =
+        top[0];
 
-  const candidates =
-    createVoiceCandidates(
-      segments,
-      duration,
-      audioInfo
+    } else if (
+      candidates.length > 0
+    ) {
+
+      best =
+        [...candidates].sort(
+          (a, b) =>
+            b.score -
+            a.score
+        )[0];
+
+    }
+
+
+    /*
+    ====================================================
+    STEP 7
+    GLOBAL STATISTICS
+    ====================================================
+    */
+
+    const speechPercent =
+      videoDuration > 0
+        ? (
+            totalSpeechTime /
+            videoDuration
+          ) * 100
+        : 0;
+
+
+    const sensitiveSegments =
+      reports
+        .sensitive
+        .segments;
+
+
+    const balancedSegments =
+      reports
+        .balanced
+        .segments;
+
+
+    const strictSegments =
+      reports
+        .strict
+        .segments;
+
+
+    /*
+    ====================================================
+    COMPLETE
+    ====================================================
+    */
+
+    if (
+      typeof progressCallback ===
+      "function"
+    ) {
+
+      progressCallback(
+        100
+      );
+
+    }
+
+
+    console.log("");
+    console.log(
+      "======================================================"
+    );
+
+    console.log(
+      "🎤 VOICE ENGINE MAX V5 COMPLETE"
+    );
+
+    console.log(
+      "Speech:",
+      round(
+        totalSpeechTime,
+        2
+      ),
+      "sec"
+    );
+
+    console.log(
+      "Speech:",
+      round(
+        speechPercent,
+        2
+      ),
+      "%"
+    );
+
+    console.log(
+      "Consensus segments:",
+      speechSegments.length
+    );
+
+    console.log(
+      "Candidates:",
+      candidates.length
     );
 
 
-  // ===============================================
-  // STEP 6 — TOP RESULTS
-  // ===============================================
+    if (
+      best
+    ) {
 
-  const top =
-    getTopSeparated(
-      candidates,
-      10,
-      20
+      console.log(
+        "BEST:",
+        best.start,
+        "->",
+        best.end,
+        "SCORE:",
+        best.score
+      );
+
+    } else {
+
+      console.log(
+        "BEST: NONE"
+      );
+
+    }
+
+
+    console.log(
+      "======================================================"
     );
 
 
-  const best =
-    top.length
-      ? top[0]
-      : null;
+    /*
+    ====================================================
+    RETURN RESULT
+    ====================================================
+    */
 
+    return {
 
-  if (onProgress) {
-    onProgress(100, "Voice analysis complete.");
+      engine:
+        "Voice Engine MAX V5",
+
+      detector:
+        "Silero VAD",
+
+      detectorMode:
+        "multi-threshold consensus",
+
+      duration:
+        round(
+          videoDuration
+        ),
+
+      speechSegments:
+        speechSegments,
+
+      speechSegmentCount:
+        speechSegments.length,
+
+      totalSpeechTime:
+        round(
+          totalSpeechTime
+        ),
+
+      speechPercent:
+        round(
+          speechPercent,
+          2
+        ),
+
+      profileStats: {
+
+        sensitive: {
+
+          threshold:
+            VAD_PROFILES[0]
+              .threshold,
+
+          holdoffMs:
+            VAD_PROFILES[0]
+              .holdoffMs,
+
+          rawSegmentCount:
+            sensitiveSegments.length,
+
+          scoreWindows:
+            reports
+              .sensitive
+              .scores.length
+
+        },
+
+        balanced: {
+
+          threshold:
+            VAD_PROFILES[1]
+              .threshold,
+
+          holdoffMs:
+            VAD_PROFILES[1]
+              .holdoffMs,
+
+          rawSegmentCount:
+            balancedSegments.length,
+
+          scoreWindows:
+            reports
+              .balanced
+              .scores.length
+
+        },
+
+        strict: {
+
+          threshold:
+            VAD_PROFILES[2]
+              .threshold,
+
+          holdoffMs:
+            VAD_PROFILES[2]
+              .holdoffMs,
+
+          rawSegmentCount:
+            strictSegments.length,
+
+          scoreWindows:
+            reports
+              .strict
+              .scores.length
+
+        }
+
+      },
+
+      candidatesAnalyzed:
+        candidates.length,
+
+      top:
+        top,
+
+      best:
+        best,
+
+      settings: {
+
+        sampleRate:
+          SAMPLE_RATE,
+
+        clipDuration:
+          CLIP_DURATION,
+
+        windowStep:
+          WINDOW_STEP,
+
+        minSpeechDuration:
+          MIN_SPEECH_DURATION,
+
+        segmentGap:
+          SEGMENT_GAP,
+
+        topLimit:
+          TOP_LIMIT,
+
+        separationSeconds:
+          SEPARATION_SECONDS,
+
+        vadProfiles:
+          VAD_PROFILES
+
+      }
+
+    };
+
+  } finally {
+
+    cleanupTempAudio(
+      wavPath
+    );
+
   }
-
-
-  console.log("");
-  console.log(
-    "[VOICE] Mean volume:",
-    audioInfo.meanVolume,
-    "dB"
-  );
-
-  console.log(
-    "[VOICE] Max volume:",
-    audioInfo.maxVolume,
-    "dB"
-  );
-
-  console.log(
-    "[VOICE] Active segments:",
-    segments.length
-  );
-
-  console.log(
-    "[VOICE] Best:",
-    best
-  );
-
-  console.log(
-    "======================================"
-  );
-
-
-  return {
-
-    ok: true,
-
-    engine: "MAX VOICE ENGINE V3",
-
-    duration,
-
-    audioInfo,
-
-    silenceEvents,
-
-    activeSegments: segments,
-
-    candidates,
-
-    top10: top,
-
-    best
-
-  };
 
 }
 
 
-// =====================================================
-// EXPORT
-// =====================================================
+/* ======================================================
+   EXPORTS
+====================================================== */
 
 module.exports = {
 
   analyzeVoice,
 
-  getAudioInfo,
+  extractVoiceAudio,
 
-  detectSilence,
+  runSileroProfile,
 
-  analyzeAudioActivity,
+  normalizeSegments,
 
-  buildActiveSegments,
-
-  calculateActiveTime,
-
-  calculateContinuity,
+  mergeSegments,
 
   createVoiceCandidates,
 
-  getTopSeparated
+  getTopSeparated,
+
+  calculateVoiceScore
 
 };
