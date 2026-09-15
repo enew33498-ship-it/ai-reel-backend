@@ -1,2406 +1,1606 @@
-/*
-========================================================
- AI REEL EDITOR
- MOVEMENT ENGINE MAX V1
-========================================================
-
-PURPOSE
--------
-Visual movement analysis only.
-
-THIS ENGINE:
-- DOES NOT CREATE MP4
-- DOES NOT MODIFY ORIGINAL VIDEO
-- DOES NOT TOUCH /cut
-- DOES NOT TOUCH EXISTING VOICE ENGINE
-- ONLY ANALYZES VISUAL MOVEMENT
-
-PIPELINE
---------
-
-VIDEO
-  ↓
-FFmpeg low-resolution analysis stream
-  ↓
-Frame difference
-  ↓
-Motion intensity
-  ↓
-Motion peaks
-  ↓
-Motion acceleration
-  ↓
-Motion stability
-  ↓
-Scene-change detection
-  ↓
-30-second candidate windows
-  ↓
-TOP 10
-  ↓
-BEST MOVEMENT MOMENT
-
-========================================================
-*/
-
 "use strict";
 
+/*
+=========================================================
+ MOVEMENT ENGINE MAX
+ Version: 2.0
+ Purpose:
+ - Analyze real uploaded video
+ - Detect visual movement/activity
+ - Detect motion peaks
+ - Detect scene/cut changes
+ - Measure momentum
+ - Measure acceleration
+ - Measure stability
+ - Measure activity density
+ - Score 30-second windows
+ - Return Top 10 moments + Best moment
 
-/* ======================================================
-   IMPORTS
-====================================================== */
+ IMPORTANT:
+ - Does NOT create MP4
+ - Does NOT modify /cut
+ - Does NOT modify Voice Engine
+ - Streams video frames instead of storing the entire video
+ - Designed for long videos
+=========================================================
+*/
 
 const fs = require("fs");
-const path = require("path");
 const os = require("os");
+const path = require("path");
 const crypto = require("crypto");
 const { spawn } = require("child_process");
 
-
-/* ======================================================
+/* =====================================================
    CONFIG
-====================================================== */
+===================================================== */
 
-/*
-Low-resolution analysis keeps Render CPU usage
-reasonable while still preserving movement information.
-*/
+const CONFIG = {
+  analysisWidth: 320,
+  analysisHeight: 180,
 
-const ANALYSIS_WIDTH = 320;
+  fps: 4,
 
-const ANALYSIS_HEIGHT = 180;
+  clipDuration: 30,
+  windowStep: 1,
 
+  sampleStep: 16,
 
-/*
-Frames analyzed per second.
+  smoothingRadius: 2,
 
-Higher = more detail.
-Lower = less CPU.
+  sceneThreshold: 0.55,
+  strongSceneThreshold: 0.75,
 
-5 FPS is a good balance.
-*/
+  motionPeakThreshold: 0.70,
 
-const ANALYSIS_FPS = 5;
+  topLimit: 10,
+  separationSeconds: 5,
 
+  maxAnalysisFrames: 1000000,
 
-/*
-30 second reel target.
-*/
+  tempPrefix: "movement-max-"
+};
 
-const CLIP_DURATION = 30;
+/* =====================================================
+   HELPERS
+===================================================== */
 
-
-/*
-Candidate window step.
-
-1 second means we test:
-
-0-30
-1-31
-2-32
-3-33
-...
-
-This gives good precision.
-*/
-
-const WINDOW_STEP = 1;
-
-
-/*
-Scene change threshold.
-
-This is intentionally conservative.
-*/
-
-const SCENE_CHANGE_THRESHOLD = 0.35;
-
-
-/*
-Maximum number of returned candidates.
-*/
-
-const TOP_LIMIT = 10;
-
-
-/*
-Minimum distance between top candidates.
-*/
-
-const SEPARATION_SECONDS = 5;
-
-
-/*
-Maximum number of raw frames kept in memory.
-
-The engine does NOT need to keep the whole video.
-*/
-
-const MAX_ANALYSIS_FRAMES = 200000;
-
-
-/* ======================================================
-   SAFE NUMBER
-====================================================== */
-
-function safeNumber(
-  value,
-  fallback = 0
-) {
-
-  const n =
-    Number(value);
-
-  if (
-    !Number.isFinite(n)
-  ) {
-
-    return fallback;
-
-  }
-
-  return n;
-
+function safeNumber(value, fallback = 0) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
 }
 
-
-/* ======================================================
-   CLAMP
-====================================================== */
-
-function clamp(
-  value,
-  min = 0,
-  max = 1
-) {
-
-  return Math.min(
-    max,
-    Math.max(
-      min,
-      safeNumber(value)
-    )
-  );
-
+function clamp(value, min = 0, max = 1) {
+  return Math.max(min, Math.min(max, value));
 }
 
-
-/* ======================================================
-   ROUND
-====================================================== */
-
-function round(
-  value,
-  digits = 4
-) {
-
-  const factor =
-    Math.pow(
-      10,
-      digits
-    );
-
-  return Math.round(
-    safeNumber(value) *
-      factor
-  ) / factor;
-
+function round(value, digits = 4) {
+  const p = Math.pow(10, digits);
+  return Math.round(value * p) / p;
 }
 
-
-/* ======================================================
-   RUN COMMAND
-====================================================== */
-
-function runCommand(
-  command,
-  args = []
-) {
-
-  return new Promise(
-    (resolve, reject) => {
-
-      const child =
-        spawn(
-          command,
-          args,
-          {
-            stdio: [
-              "ignore",
-              "pipe",
-              "pipe"
-            ]
-          }
-        );
-
-
-      let stdout = "";
-
-      let stderr = "";
-
-
-      child.stdout.on(
-        "data",
-        data => {
-
-          stdout +=
-            data.toString();
-
-        }
-      );
-
-
-      child.stderr.on(
-        "data",
-        data => {
-
-          stderr +=
-            data.toString();
-
-        }
-      );
-
-
-      child.on(
-        "error",
-        error => {
-
-          reject(error);
-
-        }
-      );
-
-
-      child.on(
-        "close",
-        code => {
-
-          if (
-            code !== 0
-          ) {
-
-            const error =
-              new Error(
-                `${command} failed with exit code ${code}\n${stderr.slice(-6000)}`
-              );
-
-            error.code =
-              code;
-
-            error.stderr =
-              stderr;
-
-            error.stdout =
-              stdout;
-
-            reject(
-              error
-            );
-
-            return;
-
-          }
-
-
-          resolve({
-
-            stdout,
-
-            stderr
-
-          });
-
-        }
-      );
-
-    }
-  );
-
-}
-
-
-/* ======================================================
-   GET VIDEO INFORMATION
-====================================================== */
-
-async function getVideoInfo(
-  videoPath
-) {
-
-  const result =
-    await runCommand(
-      "ffprobe",
-      [
-        "-v",
-        "error",
-
-        "-show_entries",
-        "format=duration",
-
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-
-        videoPath
-      ]
-    );
-
-
-  const duration =
-    safeNumber(
-      result.stdout.trim()
-    );
-
-
-  if (
-    duration <= 0
-  ) {
-
-    throw new Error(
-      "Could not determine video duration."
-    );
-
-  }
-
-
-  return {
-
-    duration
-
-  };
-
-}
-
-
-/* ======================================================
-   FRAME DIFFERENCE
-====================================================== */
-
-/*
-Calculate visual difference between two grayscale frames.
-
-The frames are raw gray8 data.
-
-Result:
-0 = almost identical
-1 = very large visual change
-*/
-
-function calculateFrameDifference(
-  previous,
-  current
-) {
-
-  if (
-    !previous ||
-    !current ||
-    previous.length !==
-      current.length
-  ) {
-
-    return 0;
-
-  }
-
+function average(values) {
+  if (!values || values.length === 0) return 0;
 
   let total = 0;
 
-  const length =
-    current.length;
+  for (let i = 0; i < values.length; i++) {
+    total += values[i];
+  }
 
+  return total / values.length;
+}
 
-  /*
-  Sampling every few pixels reduces CPU
-  while preserving global movement.
-  */
+function variance(values) {
+  if (!values || values.length < 2) return 0;
 
-  const stride = 4;
+  const avg = average(values);
 
+  let total = 0;
 
-  let count = 0;
+  for (let i = 0; i < values.length; i++) {
+    const d = values[i] - avg;
+    total += d * d;
+  }
 
+  return total / values.length;
+}
+
+function standardDeviation(values) {
+  return Math.sqrt(variance(values));
+}
+
+function percentile(values, p) {
+  if (!values || values.length === 0) return 0;
+
+  const sorted = values.slice().sort((a, b) => a - b);
+
+  const index = (sorted.length - 1) * p;
+
+  const lower = Math.floor(index);
+  const upper = Math.ceil(index);
+
+  if (lower === upper) {
+    return sorted[lower];
+  }
+
+  const weight = index - lower;
+
+  return (
+    sorted[lower] * (1 - weight) +
+    sorted[upper] * weight
+  );
+}
+
+function median(values) {
+  return percentile(values, 0.5);
+}
+
+/* =====================================================
+   COMMAND RUNNER
+===================================================== */
+
+function runCommand(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      windowsHide: true,
+      ...options
+    });
+
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.on("data", chunk => {
+      stdout += chunk.toString();
+    });
+
+    child.stderr.on("data", chunk => {
+      stderr += chunk.toString();
+    });
+
+    child.on("error", reject);
+
+    child.on("close", code => {
+      if (code === 0) {
+        resolve({
+          stdout,
+          stderr
+        });
+      } else {
+        reject(
+          new Error(
+            `${command} exited with code ${code}\n${stderr}`
+          )
+        );
+      }
+    });
+  });
+}
+
+/* =====================================================
+   VIDEO INFO
+===================================================== */
+
+async function getVideoInfo(videoPath) {
+  const result = await runCommand("ffprobe", [
+    "-v",
+    "error",
+
+    "-show_entries",
+    "format=duration",
+
+    "-show_entries",
+    "stream=width,height,r_frame_rate",
+
+    "-of",
+    "json",
+
+    videoPath
+  ]);
+
+  let data;
+
+  try {
+    data = JSON.parse(result.stdout);
+  } catch {
+    data = {};
+  }
+
+  const duration = safeNumber(
+    data?.format?.duration,
+    0
+  );
+
+  const videoStream =
+    Array.isArray(data.streams)
+      ? data.streams.find(
+          stream =>
+            stream.width &&
+            stream.height
+        )
+      : null;
+
+  return {
+    duration,
+    width: safeNumber(videoStream?.width, 0),
+    height: safeNumber(videoStream?.height, 0)
+  };
+}
+
+/* =====================================================
+   FRAME MOTION
+===================================================== */
+
+/*
+We compare sampled pixels from previous frame
+and current frame.
+
+Instead of keeping every frame, only two frames
+exist in memory.
+*/
+
+function calculateFrameMotion(
+  previousFrame,
+  currentFrame
+) {
+  if (!previousFrame || !currentFrame) {
+    return 0;
+  }
+
+  const length = Math.min(
+    previousFrame.length,
+    currentFrame.length
+  );
+
+  let totalDifference = 0;
+  let samples = 0;
+
+  const step = CONFIG.sampleStep;
 
   for (
     let i = 0;
     i < length;
-    i += stride
+    i += step
   ) {
+    const a = previousFrame[i];
+    const b = currentFrame[i];
 
-    total +=
-      Math.abs(
-        current[i] -
-        previous[i]
-      );
+    totalDifference += Math.abs(a - b) / 255;
 
-
-    count++;
-
+    samples++;
   }
 
+  if (samples === 0) return 0;
 
-  if (
-    count === 0
-  ) {
-
-    return 0;
-
-  }
-
-
-  /*
-  Pixel difference range = 0..255
-
-  Normalize to 0..1
-  */
-
-  return clamp(
-    (
-      total /
-      count
-    ) / 255
-  );
-
+  return totalDifference / samples;
 }
 
+/* =====================================================
+   SMOOTH
+===================================================== */
 
-/* ======================================================
-   SMOOTH VALUES
-====================================================== */
+function smoothValues(values, radius = 2) {
+  if (!values.length) return [];
 
-function smoothValues(
-  values,
-  radius = 2
-) {
+  const result = new Array(values.length);
 
-  if (
-    values.length === 0
-  ) {
-
-    return [];
-
-  }
-
-
-  const output =
-    new Array(
-      values.length
+  for (let i = 0; i < values.length; i++) {
+    const start = Math.max(0, i - radius);
+    const end = Math.min(
+      values.length - 1,
+      i + radius
     );
-
-
-  for (
-    let i = 0;
-    i < values.length;
-    i++
-  ) {
 
     let total = 0;
-
     let count = 0;
 
-
-    const start =
-      Math.max(
-        0,
-        i - radius
-      );
-
-
-    const end =
-      Math.min(
-        values.length - 1,
-        i + radius
-      );
-
-
-    for (
-      let j = start;
-      j <= end;
-      j++
-    ) {
-
-      total +=
-        values[j];
-
+    for (let j = start; j <= end; j++) {
+      total += values[j];
       count++;
-
     }
 
-
-    output[i] =
-      count > 0
-        ? total / count
-        : 0;
-
+    result[i] = total / count;
   }
 
-
-  return output;
-
+  return result;
 }
 
-
-/* ======================================================
+/* =====================================================
    NORMALIZE MOTION
-====================================================== */
+===================================================== */
 
-function normalizeMotion(
-  values
-) {
+function normalizeMotion(values) {
+  if (!values.length) return [];
 
-  if (
-    values.length === 0
-  ) {
+  const p50 = percentile(values, 0.50);
+  const p90 = percentile(values, 0.90);
+  const p98 = percentile(values, 0.98);
 
-    return [];
-
-  }
-
-
-  /*
-  Robust normalization.
-
-  We use the 90th percentile rather than
-  the absolute maximum so one unusual frame
-  does not distort the entire video.
-  */
-
-  const sorted =
-    [...values].sort(
-      (a, b) =>
-        a - b
-    );
-
-
-  const index =
-    Math.floor(
-      sorted.length *
-      0.90
-    );
-
-
-  const reference =
+  const scale =
     Math.max(
-      0.0001,
-      sorted[
+      p90 - p50,
+      0.000001
+    );
+
+  return values.map(value => {
+    let normalized =
+      (value - p50) / scale;
+
+    normalized =
+      clamp(normalized, 0, 1);
+
+    /*
+    Extra emphasis for exceptional movement.
+    */
+
+    if (value >= p98) {
+      normalized =
         Math.min(
-          index,
-          sorted.length - 1
-        )
-      ]
-    );
-
-
-  return values.map(
-    value =>
-      clamp(
-        value /
-        reference
-      )
-  );
-
-}
-
-
-/* ======================================================
-   CALCULATE PEAK
-====================================================== */
-
-function calculatePeak(
-  values
-) {
-
-  if (
-    values.length === 0
-  ) {
-
-    return 0;
-
-  }
-
-
-  let peak = 0;
-
-
-  for (
-    const value of values
-  ) {
-
-    peak =
-      Math.max(
-        peak,
-        clamp(value)
-      );
-
-  }
-
-
-  return peak;
-
-}
-
-
-/* ======================================================
-   CALCULATE AVERAGE
-====================================================== */
-
-function calculateAverage(
-  values
-) {
-
-  if (
-    values.length === 0
-  ) {
-
-    return 0;
-
-  }
-
-
-  const total =
-    values.reduce(
-      (
-        sum,
-        value
-      ) =>
-        sum + value,
-      0
-    );
-
-
-  return clamp(
-    total /
-    values.length
-  );
-
-}
-
-
-/* ======================================================
-   CALCULATE VARIANCE
-====================================================== */
-
-function calculateVariance(
-  values
-) {
-
-  if (
-    values.length < 2
-  ) {
-
-    return 0;
-
-  }
-
-
-  const mean =
-    calculateAverage(
-      values
-    );
-
-
-  let total = 0;
-
-
-  for (
-    const value of
-    values
-  ) {
-
-    total +=
-      Math.pow(
-        value - mean,
-        2
-      );
-
-  }
-
-
-  return total /
-    values.length;
-
-}
-
-
-/* ======================================================
-   MOTION STABILITY
-====================================================== */
-
-function calculateMotionStability(
-  values
-) {
-
-  if (
-    values.length === 0
-  ) {
-
-    return 0;
-
-  }
-
-
-  const variance =
-    calculateVariance(
-      values
-    );
-
-
-  /*
-  Higher stability when movement
-  doesn't fluctuate wildly.
-  */
-
-  return clamp(
-    1 -
-    Math.sqrt(
-      variance
-    )
-  );
-
-}
-
-
-/* ======================================================
-   MOTION ACCELERATION
-====================================================== */
-
-function calculateMotionAcceleration(
-  values
-) {
-
-  if (
-    values.length < 2
-  ) {
-
-    return 0;
-
-  }
-
-
-  let total = 0;
-
-  let count = 0;
-
-
-  for (
-    let i = 1;
-    i < values.length;
-    i++
-  ) {
-
-    total +=
-      Math.abs(
-        values[i] -
-        values[i - 1]
-      );
-
-
-    count++;
-
-  }
-
-
-  if (
-    count === 0
-  ) {
-
-    return 0;
-
-  }
-
-
-  return clamp(
-    total /
-    count
-  );
-
-}
-
-
-/* ======================================================
-   MOTION MOMENTUM
-====================================================== */
-
-function calculateMomentum(
-  values
-) {
-
-  if (
-    values.length < 3
-  ) {
-
-    return 0;
-
-  }
-
-
-  let rising = 0;
-
-  let count = 0;
-
-
-  for (
-    let i = 2;
-    i < values.length;
-    i++
-  ) {
-
-    const previous =
-      values[i - 1];
-
-
-    const current =
-      values[i];
-
-
-    const before =
-      values[i - 2];
-
-
-    const firstDelta =
-      previous -
-      before;
-
-
-    const secondDelta =
-      current -
-      previous;
-
-
-    if (
-      firstDelta > 0 &&
-      secondDelta > 0
-    ) {
-
-      rising++;
-
+          1,
+          normalized * 1.12
+        );
     }
 
-
-    count++;
-
-  }
-
-
-  return count > 0
-    ? rising / count
-    : 0;
-
+    return normalized;
+  });
 }
 
+/* =====================================================
+   FRAME STREAM ANALYSIS
+===================================================== */
 
-/* ======================================================
-   FIND PEAKS
-====================================================== */
-
-function findMotionPeaks(
-  values,
-  threshold = 0.70
-) {
-
-  const peaks = [];
-
-
-  if (
-    values.length < 3
-  ) {
-
-    return peaks;
-
-  }
-
-
-  for (
-    let i = 1;
-    i <
-      values.length - 1;
-    i++
-  ) {
-
-    const current =
-      values[i];
-
-
-    if (
-      current <
-      threshold
-    ) {
-
-      continue;
-
-    }
-
-
-    const previous =
-      values[i - 1];
-
-
-    const next =
-      values[i + 1];
-
-
-    if (
-      current >= previous &&
-      current >= next
-    ) {
-
-      peaks.push({
-
-        index:
-          i,
-
-        value:
-          current
-
-      });
-
-    }
-
-  }
-
-
-  return peaks;
-
-}
-
-
-/* ======================================================
-   DETECT SCENE CHANGES
-====================================================== */
-
-function detectSceneChanges(
-  motionValues
-) {
-
-  const changes = [];
-
-
-  if (
-    motionValues.length < 3
-  ) {
-
-    return changes;
-
-  }
-
-
-  for (
-    let i = 1;
-    i <
-      motionValues.length;
-    i++
-  ) {
-
-    const current =
-      motionValues[i];
-
-
-    const previous =
-      motionValues[i - 1];
-
-
-    const jump =
-      Math.abs(
-        current -
-        previous
-      );
-
-
-    if (
-      jump >=
-      SCENE_CHANGE_THRESHOLD
-    ) {
-
-      changes.push({
-
-        index:
-          i,
-
-        jump:
-          round(
-            jump
-          )
-
-      });
-
-    }
-
-  }
-
-
-  return changes;
-
-}
-
-
-/* ======================================================
-   READ RAW FRAMES
-====================================================== */
-
-/*
-FFmpeg outputs gray8 frames directly to stdout.
-
-This avoids writing thousands of temporary image files.
-*/
-
-function readFrames(
+async function streamMotionFrames(
   videoPath,
   duration,
   progressCallback
 ) {
+  return new Promise((resolve, reject) => {
+    const frameSize =
+      CONFIG.analysisWidth *
+      CONFIG.analysisHeight;
 
-  return new Promise(
-    (resolve, reject) => {
+    const ffmpegArgs = [
+      "-hide_banner",
+      "-loglevel",
+      "error",
 
-      const frameSize =
-        ANALYSIS_WIDTH *
-        ANALYSIS_HEIGHT;
+      "-i",
+      videoPath,
 
+      "-an",
 
-      const args = [
+      "-vf",
+      `fps=${CONFIG.fps},scale=${CONFIG.analysisWidth}:${CONFIG.analysisHeight}:flags=fast_bilinear,format=gray`,
 
-        "-hide_banner",
+      "-f",
+      "rawvideo",
 
-        "-loglevel",
-        "error",
+      "-pix_fmt",
+      "gray",
 
-        "-i",
-        videoPath,
+      "pipe:1"
+    ];
 
-        "-vf",
-        `fps=${ANALYSIS_FPS},scale=${ANALYSIS_WIDTH}:${ANALYSIS_HEIGHT}:flags=fast_bilinear,format=gray`,
+    const child = spawn(
+      "ffmpeg",
+      ffmpegArgs,
+      {
+        windowsHide: true
+      }
+    );
 
-        "-f",
-        "rawvideo",
+    let buffer = Buffer.alloc(0);
 
-        "-pix_fmt",
-        "gray",
+    let previousFrame = null;
 
-        "pipe:1"
+    const rawMotion = [];
 
-      ];
+    let frameIndex = 0;
 
+    let lastProgress = 0;
 
-      const child =
-        spawn(
-          "ffmpeg",
-          args,
-          {
-            stdio: [
-              "ignore",
-              "pipe",
-              "pipe"
-            ]
-          }
-        );
+    child.stdout.on("data", chunk => {
+      buffer = Buffer.concat([
+        buffer,
+        chunk
+      ]);
 
-
-      let stderr = "";
-
-
-      const frames = [];
-
-
-      let buffer =
-        Buffer.alloc(0);
-
-
-      let frameCount = 0;
-
-
-      child.stderr.on(
-        "data",
-        data => {
-
-          stderr +=
-            data.toString();
-
-        }
-      );
-
-
-      child.stdout.on(
-        "data",
-        chunk => {
-
-          buffer =
-            Buffer.concat([
-              buffer,
-              chunk
-            ]);
-
-
-          while (
-            buffer.length >=
+      while (
+        buffer.length >= frameSize
+      ) {
+        const frame =
+          buffer.subarray(
+            0,
             frameSize
-          ) {
+          );
 
-            if (
-              frameCount >=
-              MAX_ANALYSIS_FRAMES
-            ) {
+        buffer =
+          buffer.subarray(
+            frameSize
+          );
 
-              child.kill(
-                "SIGTERM"
-              );
+        const currentFrame =
+          Buffer.from(frame);
 
-              break;
-
-            }
-
-
-            const frame =
-              Buffer.from(
-                buffer.subarray(
-                  0,
-                  frameSize
-                )
-              );
-
-
-            buffer =
-              buffer.subarray(
-                frameSize
-              );
-
-
-            frames.push(
-              frame
+        if (previousFrame) {
+          const motion =
+            calculateFrameMotion(
+              previousFrame,
+              currentFrame
             );
 
+          rawMotion.push(motion);
+        }
 
-            frameCount++;
+        previousFrame =
+          currentFrame;
 
+        frameIndex++;
+
+        if (
+          frameIndex >
+          CONFIG.maxAnalysisFrames
+        ) {
+          child.kill("SIGKILL");
+
+          reject(
+            new Error(
+              "Movement analysis frame limit exceeded."
+            )
+          );
+
+          return;
+        }
+
+        if (
+          duration > 0 &&
+          frameIndex % 20 === 0
+        ) {
+          const currentTime =
+            frameIndex /
+            CONFIG.fps;
+
+          const progress =
+            Math.min(
+              95,
+              Math.round(
+                (currentTime /
+                  duration) *
+                  95
+              )
+            );
+
+          if (
+            progress >
+            lastProgress
+          ) {
+            lastProgress =
+              progress;
 
             if (
               typeof progressCallback ===
               "function"
             ) {
-
-              const analyzedDuration =
-                frameCount /
-                ANALYSIS_FPS;
-
-
-              const percentage =
-                duration > 0
-                  ? Math.min(
-                      65,
-                      25 +
-                      (
-                        analyzedDuration /
-                        duration
-                      ) *
-                      40
-                    )
-                  : 40;
-
-
               progressCallback(
-                Math.round(
-                  percentage
-                )
+                progress
               );
-
             }
-
           }
-
         }
-      );
+      }
+    });
 
+    let stderr = "";
 
-      child.on(
-        "error",
-        error => {
-
-          reject(
-            error
-          );
-
-        }
-      );
-
-
-      child.on(
-        "close",
-        code => {
-
-          if (
-            code !== 0 &&
-            code !== 255
-          ) {
-
-            const error =
-              new Error(
-                `FFmpeg frame analysis failed with exit code ${code}\n${stderr.slice(-6000)}`
-              );
-
-            error.code =
-              code;
-
-            error.stderr =
-              stderr;
-
-            reject(
-              error
-            );
-
-            return;
-
-          }
-
-
-          resolve(
-            frames
-          );
-
-        }
-      );
-
-    }
-  );
-
-}
-
-
-/* ======================================================
-   BUILD MOTION TIMELINE
-====================================================== */
-
-function buildMotionTimeline(
-  frames
-) {
-
-  const rawMotion = [];
-
-
-  let previous =
-    null;
-
-
-  for (
-    let i = 0;
-    i < frames.length;
-    i++
-  ) {
-
-    const current =
-      frames[i];
-
-
-    if (
-      previous
-    ) {
-
-      rawMotion.push(
-        calculateFrameDifference(
-          previous,
-          current
-        )
-      );
-
-    } else {
-
-      rawMotion.push(
-        0
-      );
-
-    }
-
-
-    previous =
-      current;
-
-  }
-
-
-  const normalized =
-    normalizeMotion(
-      rawMotion
+    child.stderr.on(
+      "data",
+      chunk => {
+        stderr += chunk.toString();
+      }
     );
 
+    child.on("error", reject);
+
+    child.on("close", code => {
+      if (code !== 0) {
+        reject(
+          new Error(
+            `FFmpeg movement analysis failed: ${stderr}`
+          )
+        );
+
+        return;
+      }
+
+      resolve({
+        rawMotion,
+        frames: frameIndex
+      });
+    });
+  });
+}
+
+/* =====================================================
+   BUILD TIMELINE
+===================================================== */
+
+function buildMotionTimeline(
+  rawMotion,
+  duration
+) {
+  if (!rawMotion.length) {
+    return {
+      values: [],
+      times: [],
+      normalized: []
+    };
+  }
 
   const smoothed =
     smoothValues(
-      normalized,
-      2
+      rawMotion,
+      CONFIG.smoothingRadius
     );
 
+  const normalized =
+    normalizeMotion(
+      smoothed
+    );
 
-  const timeline = [];
-
+  const times = new Array(
+    normalized.length
+  );
 
   for (
     let i = 0;
-    i < smoothed.length;
+    i < normalized.length;
     i++
   ) {
-
-    timeline.push({
-
-      time:
-        round(
-          i /
-          ANALYSIS_FPS,
-          3
-        ),
-
-      rawMotion:
-        round(
-          rawMotion[i],
-          5
-        ),
-
-      motion:
-        round(
-          smoothed[i],
-          4
-        )
-
-    });
-
+    times[i] =
+      (i + 1) /
+      CONFIG.fps;
   }
 
-
-  return timeline;
-
+  return {
+    values: smoothed,
+    normalized,
+    times,
+    duration
+  };
 }
 
+/* =====================================================
+   MOTION PEAKS
+===================================================== */
 
-/* ======================================================
-   GET WINDOW VALUES
-====================================================== */
+function findMotionPeaks(
+  normalized,
+  times
+) {
+  const peaks = [];
+
+  if (normalized.length < 3) {
+    return peaks;
+  }
+
+  for (
+    let i = 1;
+    i <
+    normalized.length - 1;
+    i++
+  ) {
+    const current =
+      normalized[i];
+
+    const previous =
+      normalized[i - 1];
+
+    const next =
+      normalized[i + 1];
+
+    if (
+      current >=
+        CONFIG.motionPeakThreshold &&
+      current >= previous &&
+      current >= next
+    ) {
+      peaks.push({
+        time: round(times[i], 3),
+        motion: round(current, 4)
+      });
+    }
+  }
+
+  peaks.sort(
+    (a, b) =>
+      b.motion - a.motion
+  );
+
+  return peaks.slice(0, 50);
+}
+
+/* =====================================================
+   SCENE CHANGES
+===================================================== */
+
+function detectSceneChanges(
+  normalized,
+  times
+) {
+  const changes = [];
+
+  for (
+    let i = 1;
+    i < normalized.length;
+    i++
+  ) {
+    const jump =
+      Math.abs(
+        normalized[i] -
+        normalized[i - 1]
+      );
+
+    if (
+      jump >=
+      CONFIG.sceneThreshold
+    ) {
+      changes.push({
+        time: round(times[i], 3),
+        strength: round(
+          clamp(jump, 0, 1),
+          4
+        )
+      });
+    }
+  }
+
+  return changes;
+}
+
+/* =====================================================
+   WINDOW EXTRACTION
+===================================================== */
 
 function getWindowValues(
   timeline,
   start,
   end
 ) {
-
   const values = [];
 
-
   for (
-    const item of
-    timeline
+    let i = 0;
+    i < timeline.times.length;
+    i++
   ) {
+    const time =
+      timeline.times[i];
 
     if (
-      item.time <
-      start
+      time >= start &&
+      time < end
     ) {
-
-      continue;
-
+      values.push(
+        timeline.normalized[i]
+      );
     }
-
-
-    if (
-      item.time >=
-      end
-    ) {
-
-      break;
-
-    }
-
-
-    values.push(
-      item.motion
-    );
-
   }
 
-
   return values;
-
 }
 
-
-/* ======================================================
+/* =====================================================
    WINDOW SCENE CHANGES
-====================================================== */
+===================================================== */
 
 function getWindowSceneChanges(
   sceneChanges,
   start,
   end
 ) {
-
-  const result = [];
-
-
-  for (
-    const change of
-    sceneChanges
-  ) {
-
-    const time =
-      change.index /
-      ANALYSIS_FPS;
-
-
-    if (
-      time <
-      start
-    ) {
-
-      continue;
-
-    }
-
-
-    if (
-      time >=
-      end
-    ) {
-
-      break;
-
-    }
-
-
-    result.push({
-
-      time:
-        round(
-          time
-        ),
-
-      jump:
-        change.jump
-
-    });
-
-  }
-
-
-  return result;
-
+  return sceneChanges.filter(
+    change =>
+      change.time >= start &&
+      change.time < end
+  );
 }
 
+/* =====================================================
+   WINDOW FEATURES
+===================================================== */
 
-/* ======================================================
-   SCORE MOVEMENT WINDOW
-====================================================== */
-
-function scoreMovementWindow(
-  start,
-  end,
-  timeline,
-  sceneChanges
+function calculateWindowFeatures(
+  values,
+  sceneChanges,
+  duration
 ) {
-
-  const values =
-    getWindowValues(
-      timeline,
-      start,
-      end
-    );
-
-
-  if (
-    values.length === 0
-  ) {
-
-    return null;
-
+  if (!values.length) {
+    return {
+      averageMotion: 0,
+      peakMotion: 0,
+      minimumMotion: 0,
+      stability: 0,
+      momentum: 0,
+      acceleration: 0,
+      density: 0,
+      activeTime: 0,
+      activePercent: 0,
+      motionVariance: 0,
+      motionMedian: 0
+    };
   }
-
 
   const averageMotion =
-    calculateAverage(
-      values
-    );
-
+    average(values);
 
   const peakMotion =
-    calculatePeak(
-      values
-    );
+    Math.max(...values);
 
+  const minimumMotion =
+    Math.min(...values);
 
-  const acceleration =
-    calculateMotionAcceleration(
-      values
-    );
+  const motionVariance =
+    variance(values);
 
+  const motionMedian =
+    median(values);
 
-  const momentum =
-    calculateMomentum(
-      values
-    );
+  /*
+  Stability:
+  A good moment should have movement
+  without being completely random/noisy.
+  */
 
+  const deviation =
+    standardDeviation(values);
 
   const stability =
-    calculateMotionStability(
+    clamp(
+      1 -
+        deviation /
+          Math.max(
+            averageMotion,
+            0.05
+          ),
+      0,
+      1
+    );
+
+  /*
+  Momentum:
+  How much movement persists
+  across neighboring frames.
+  */
+
+  let momentumTotal = 0;
+  let momentumCount = 0;
+
+  for (
+    let i = 1;
+    i < values.length;
+    i++
+  ) {
+    const previous =
+      values[i - 1];
+
+    const current =
+      values[i];
+
+    const persistence =
+      1 -
+      Math.abs(
+        current - previous
+      );
+
+    momentumTotal +=
+      clamp(
+        persistence,
+        0,
+        1
+      );
+
+    momentumCount++;
+  }
+
+  const momentum =
+    momentumCount > 0
+      ? momentumTotal /
+        momentumCount
+      : 0;
+
+  /*
+  Acceleration:
+  movement changing rapidly.
+  */
+
+  let accelerationTotal = 0;
+  let accelerationCount = 0;
+
+  for (
+    let i = 2;
+    i < values.length;
+    i++
+  ) {
+    const a =
+      values[i - 2];
+
+    const b =
+      values[i - 1];
+
+    const c =
+      values[i];
+
+    const firstChange =
+      b - a;
+
+    const secondChange =
+      c - b;
+
+    const acceleration =
+      Math.abs(
+        secondChange -
+          firstChange
+      );
+
+    accelerationTotal +=
+      acceleration;
+
+    accelerationCount++;
+  }
+
+  const acceleration =
+    accelerationCount > 0
+      ? clamp(
+          accelerationTotal /
+            accelerationCount *
+            3,
+          0,
+          1
+        )
+      : 0;
+
+  /*
+  Activity density
+  */
+
+  let activeFrames = 0;
+
+  for (
+    let i = 0;
+    i < values.length;
+    i++
+  ) {
+    if (
+      values[i] >= 0.35
+    ) {
+      activeFrames++;
+    }
+  }
+
+  const density =
+    values.length > 0
+      ? activeFrames /
+        values.length
+      : 0;
+
+  const activePercent =
+    density * 100;
+
+  const activeTime =
+    duration * density;
+
+  return {
+    averageMotion,
+    peakMotion,
+    minimumMotion,
+    stability,
+    momentum,
+    acceleration,
+    density,
+    activeTime,
+    activePercent,
+    motionVariance,
+    motionMedian,
+    sceneCount:
+      sceneChanges.length
+  };
+}
+
+/* =====================================================
+   START / END STRENGTH
+===================================================== */
+
+function calculateEdgeStrength(
+  values
+) {
+  if (!values.length) {
+    return {
+      start: 0,
+      end: 0
+    };
+  }
+
+  const edgeCount =
+    Math.max(
+      1,
+      Math.floor(
+        values.length * 0.12
+      )
+    );
+
+  const startValues =
+    values.slice(
+      0,
+      edgeCount
+    );
+
+  const endValues =
+    values.slice(
+      values.length -
+        edgeCount
+    );
+
+  return {
+    start:
+      average(startValues),
+
+    end:
+      average(endValues)
+  };
+}
+
+/* =====================================================
+   SCORE WINDOW
+===================================================== */
+
+function scoreMovementWindow(
+  values,
+  sceneChanges,
+  start,
+  end
+) {
+  const duration =
+    Math.max(
+      0.001,
+      end - start
+    );
+
+  const features =
+    calculateWindowFeatures(
+      values,
+      sceneChanges,
+      duration
+    );
+
+  const edge =
+    calculateEdgeStrength(
       values
     );
 
-
-  const windowChanges =
-    getWindowSceneChanges(
-      sceneChanges,
-      start,
-      end
-    );
-
-
-  const sceneChangeCount =
-    windowChanges.length;
-
-
   /*
-  ------------------------------------------------------
-  MOVEMENT SCORE
+  =======================================================
+  MAX MOVEMENT SCORE — 100 POINTS
+  =======================================================
 
-  Average movement       35
-  Peak movement          25
-  Momentum               12
-  Acceleration             8
-  Scene changes            8
-  Stability                7
-  Activity floor           5
-  ------------------------------------------------------
+  Average movement       25
+  Peak movement          20
+  Momentum               15
+  Activity density       10
+  Acceleration           10
+  Scene events            7
+  Stability               5
+  Start strength          4
+  End strength            4
 
-  TOTAL = 100
-  ------------------------------------------------------
+  TOTAL                  100
+  =======================================================
   */
-
 
   const averageScore =
-    averageMotion *
-    35;
-
+    features.averageMotion * 25;
 
   const peakScore =
-    peakMotion *
-    25;
-
+    features.peakMotion * 20;
 
   const momentumScore =
-    momentum *
-    12;
+    features.momentum * 15;
 
+  const densityScore =
+    features.density * 10;
 
   const accelerationScore =
-    clamp(
-      acceleration * 3
-    ) *
-    8;
-
-
-  /*
-  A few scene changes are useful.
-
-  Too many cuts should not dominate.
-  */
-
-  let sceneQuality = 0;
-
-
-  if (
-    sceneChangeCount === 0
-  ) {
-
-    sceneQuality = 0.25;
-
-  } else if (
-    sceneChangeCount <= 2
-  ) {
-
-    sceneQuality = 1;
-
-  } else if (
-    sceneChangeCount <= 5
-  ) {
-
-    sceneQuality = 0.85;
-
-  } else if (
-    sceneChangeCount <= 10
-  ) {
-
-    sceneQuality = 0.60;
-
-  } else {
-
-    sceneQuality = 0.35;
-
-  }
-
+    features.acceleration * 10;
 
   const sceneScore =
-    sceneQuality *
-    8;
-
+    Math.min(
+      1,
+      features.sceneCount / 3
+    ) * 7;
 
   const stabilityScore =
-    stability *
-    7;
+    features.stability * 5;
 
+  const startScore =
+    edge.start * 4;
 
-  /*
-  Activity floor prevents completely
-  static windows from receiving a
-  high score from one isolated peak.
-  */
+  const endScore =
+    edge.end * 4;
 
-  const activityFloor =
-    averageMotion >= 0.15
-      ? 1
-      : averageMotion >= 0.08
-        ? 0.60
-        : averageMotion >= 0.03
-          ? 0.30
-          : 0;
-
-
-  const floorScore =
-    activityFloor *
-    5;
-
-
-  const score =
+  let score =
     averageScore +
     peakScore +
     momentumScore +
+    densityScore +
     accelerationScore +
     sceneScore +
     stabilityScore +
-    floorScore;
+    startScore +
+    endScore;
 
+  /*
+  Prevent totally inactive windows
+  from becoming high-ranked.
+  */
+
+  if (
+    features.averageMotion <
+    0.10
+  ) {
+    score *= 0.35;
+  }
+
+  if (
+    features.density <
+    0.15
+  ) {
+    score *= 0.50;
+  }
+
+  /*
+  Slight bonus for balanced activity.
+  */
+
+  if (
+    features.density >= 0.35 &&
+    features.density <= 0.95
+  ) {
+    score += 2;
+  }
+
+  score =
+    Math.min(
+      100,
+      score
+    );
 
   return {
+    start: round(start, 3),
+    end: round(end, 3),
+    duration: round(
+      duration,
+      3
+    ),
 
-    start:
-      round(
-        start
-      ),
+    activeTime: round(
+      features.activeTime,
+      3
+    ),
 
-    end:
-      round(
-        end
-      ),
+    activePercent: round(
+      features.activePercent,
+      2
+    ),
 
-    duration:
-      round(
-        end -
-        start
-      ),
+    averageMotion: round(
+      features.averageMotion,
+      4
+    ),
 
-    averageMotion:
-      round(
-        averageMotion
-      ),
+    peakMotion: round(
+      features.peakMotion,
+      4
+    ),
 
-    peakMotion:
-      round(
-        peakMotion
-      ),
+    minimumMotion: round(
+      features.minimumMotion,
+      4
+    ),
 
-    motionAcceleration:
-      round(
-        acceleration
-      ),
+    motionMedian: round(
+      features.motionMedian,
+      4
+    ),
 
-    motionMomentum:
-      round(
-        momentum
-      ),
+    motionVariance: round(
+      features.motionVariance,
+      5
+    ),
 
-    motionStability:
-      round(
-        stability
-      ),
+    stability: round(
+      features.stability,
+      4
+    ),
+
+    momentum: round(
+      features.momentum,
+      4
+    ),
+
+    acceleration: round(
+      features.acceleration,
+      4
+    ),
+
+    activityDensity: round(
+      features.density,
+      4
+    ),
 
     sceneChanges:
-      sceneChangeCount,
+      features.sceneCount,
 
-    sceneChangeStrength:
-      round(
-        windowChanges.reduce(
-          (
-            sum,
-            item
-          ) =>
-            sum +
-            item.jump,
-          0
-        )
-      ),
+    startStrength: round(
+      edge.start,
+      4
+    ),
 
-    score:
-      round(
-        clamp(
-          score /
-          100
-        ) *
-        100,
-        2
-      )
+    endStrength: round(
+      edge.end,
+      4
+    ),
 
+    score: round(
+      score,
+      2
+    )
   };
-
 }
 
-
-/* ======================================================
-   CREATE CANDIDATES
-====================================================== */
+/* =====================================================
+   CREATE 30 SECOND CANDIDATES
+===================================================== */
 
 function createMovementCandidates(
   timeline,
   sceneChanges,
   duration
 ) {
-
   const candidates = [];
 
+  const clip =
+    CONFIG.clipDuration;
 
-  const clipLength =
-    Math.min(
-      CLIP_DURATION,
-      duration
+  if (
+    duration <= clip
+  ) {
+    const values =
+      getWindowValues(
+        timeline,
+        0,
+        duration
+      );
+
+    const scenes =
+      getWindowSceneChanges(
+        sceneChanges,
+        0,
+        duration
+      );
+
+    candidates.push(
+      scoreMovementWindow(
+        values,
+        scenes,
+        0,
+        duration
+      )
     );
 
+    return candidates;
+  }
 
   const maxStart =
     Math.max(
       0,
-      duration -
-      clipLength
+      duration - clip
     );
-
 
   for (
     let start = 0;
     start <= maxStart;
-    start += WINDOW_STEP
+    start +=
+      CONFIG.windowStep
   ) {
-
     const end =
       Math.min(
         duration,
-        start +
-        clipLength
+        start + clip
       );
 
-
-    const candidate =
-      scoreMovementWindow(
-        start,
-        end,
+    const values =
+      getWindowValues(
         timeline,
-        sceneChanges
+        start,
+        end
       );
 
-
-    if (
-      candidate
-    ) {
-
-      candidates.push(
-        candidate
+    const scenes =
+      getWindowSceneChanges(
+        sceneChanges,
+        start,
+        end
       );
 
+    if (!values.length) {
+      continue;
     }
 
+    candidates.push(
+      scoreMovementWindow(
+        values,
+        scenes,
+        start,
+        end
+      )
+    );
   }
-
 
   /*
-  Always test final possible window.
+  Ensure final possible window exists.
   */
 
-  if (
-    maxStart > 0
-  ) {
+  const finalStart =
+    maxStart;
 
-    const exists =
-      candidates.some(
-        candidate =>
-          Math.abs(
-            candidate.start -
-            maxStart
-          ) <
-          0.001
+  if (
+    !candidates.some(
+      item =>
+        Math.abs(
+          item.start -
+            finalStart
+        ) < 0.001
+    )
+  ) {
+    const end =
+      Math.min(
+        duration,
+        finalStart + clip
       );
 
+    const values =
+      getWindowValues(
+        timeline,
+        finalStart,
+        end
+      );
 
-    if (
-      !exists
-    ) {
+    const scenes =
+      getWindowSceneChanges(
+        sceneChanges,
+        finalStart,
+        end
+      );
 
-      const candidate =
+    if (values.length) {
+      candidates.push(
         scoreMovementWindow(
-          maxStart,
-          maxStart +
-          clipLength,
-          timeline,
-          sceneChanges
-        );
-
-
-      if (
-        candidate
-      ) {
-
-        candidates.push(
-          candidate
-        );
-
-      }
-
+          values,
+          scenes,
+          finalStart,
+          end
+        )
+      );
     }
-
   }
 
-
   return candidates;
-
 }
 
-
-/* ======================================================
+/* =====================================================
    TOP SEPARATED
-====================================================== */
+===================================================== */
 
 function getTopSeparated(
-  candidates,
-  limit = TOP_LIMIT,
-  separation =
-    SEPARATION_SECONDS
+  candidates
 ) {
-
   const sorted =
-    [...candidates].sort(
-      (a, b) =>
-        b.score -
-        a.score
-    );
-
+    candidates
+      .slice()
+      .sort(
+        (a, b) =>
+          b.score -
+          a.score
+      );
 
   const selected = [];
 
-
   for (
-    const candidate of
-    sorted
+    let i = 0;
+    i < sorted.length;
+    i++
   ) {
+    const candidate =
+      sorted[i];
 
     const tooClose =
       selected.some(
         existing =>
           Math.abs(
-            candidate.start -
-            existing.start
+            existing.start -
+              candidate.start
           ) <
-          separation
+          CONFIG.separationSeconds
       );
 
-
-    if (
-      tooClose
-    ) {
-
-      continue;
-
+    if (!tooClose) {
+      selected.push(
+        candidate
+      );
     }
-
-
-    selected.push(
-      candidate
-    );
-
 
     if (
       selected.length >=
-      limit
+      CONFIG.topLimit
     ) {
-
       break;
-
     }
-
   }
 
-
   return selected;
-
 }
 
-
-/* ======================================================
+/* =====================================================
    ANALYZE MOVEMENT
-====================================================== */
+===================================================== */
 
 async function analyzeMovement(
   videoPath,
   duration,
   progressCallback
 ) {
-
-  const videoDuration =
-    Math.max(
-      0,
-      safeNumber(
-        duration
-      )
-    );
-
-
-  console.log("");
-  console.log(
-    "======================================================"
-  );
-
-  console.log(
-    "🎬 MOVEMENT ENGINE MAX V1"
-  );
-
-  console.log(
-    "VISUAL MOTION ANALYSIS"
-  );
-
-  console.log(
-    "DURATION:",
-    videoDuration,
-    "seconds"
-  );
-
-  console.log(
-    "======================================================"
-  );
-
-
   if (
-    videoDuration <= 0
+    !videoPath ||
+    !fs.existsSync(videoPath)
   ) {
-
     throw new Error(
-      "Invalid video duration."
+      "Video file not found."
     );
-
   }
 
+  let actualDuration =
+    safeNumber(
+      duration,
+      0
+    );
+
+  /*
+  Get duration from ffprobe if
+  caller didn't provide it.
+  */
+
+  if (
+    actualDuration <= 0
+  ) {
+    const info =
+      await getVideoInfo(
+        videoPath
+      );
+
+    actualDuration =
+      info.duration;
+  }
+
+  if (
+    actualDuration <= 0
+  ) {
+    throw new Error(
+      "Unable to determine video duration."
+    );
+  }
 
   if (
     typeof progressCallback ===
     "function"
   ) {
-
-    progressCallback(
-      5
-    );
-
+    progressCallback(3);
   }
 
-
   /*
-  ======================================================
-  STEP 1
-  GET VIDEO INFO
-  ======================================================
+  REAL VIDEO FRAME STREAM
   */
 
-  await getVideoInfo(
-    videoPath
-  );
-
-
-  if (
-    typeof progressCallback ===
-    "function"
-  ) {
-
-    progressCallback(
-      15
-    );
-
-  }
-
-
-  /*
-  ======================================================
-  STEP 2
-  READ LOW-RESOLUTION FRAMES
-  ======================================================
-  */
-
-  const frames =
-    await readFrames(
+  const streamResult =
+    await streamMotionFrames(
       videoPath,
-      videoDuration,
+      actualDuration,
       progressCallback
     );
 
-
-  console.log(
-    "[MOVEMENT MAX] FRAMES:",
-    frames.length
-  );
-
-
   if (
-    frames.length < 2
+    typeof progressCallback ===
+    "function"
   ) {
-
-    throw new Error(
-      "Not enough frames for movement analysis."
-    );
-
+    progressCallback(96);
   }
 
-
   /*
-  ======================================================
-  STEP 3
-  BUILD MOTION TIMELINE
-  ======================================================
+  Build timeline.
   */
 
   const timeline =
     buildMotionTimeline(
-      frames
+      streamResult.rawMotion,
+      actualDuration
     );
-
 
   /*
-  Frames are no longer required after
-  timeline creation.
-
-  This allows garbage collection.
+  Peaks.
   */
-
-  /*
-  ======================================================
-  STEP 4
-  GLOBAL MOTION DATA
-  ======================================================
-  */
-
-  const motionValues =
-    timeline.map(
-      item =>
-        item.motion
-    );
-
-
-  const globalAverage =
-    calculateAverage(
-      motionValues
-    );
-
-
-  const globalPeak =
-    calculatePeak(
-      motionValues
-    );
-
-
-  const globalAcceleration =
-    calculateMotionAcceleration(
-      motionValues
-    );
-
-
-  const globalStability =
-    calculateMotionStability(
-      motionValues
-    );
-
-
-  /*
-  ======================================================
-  STEP 5
-  MOTION PEAKS
-  ======================================================
-  */
-
-  const peakIndexes =
-    findMotionPeaks(
-      motionValues,
-      0.70
-    );
-
 
   const motionPeaks =
-    peakIndexes.map(
-      peak => ({
-
-        time:
-          round(
-            peak.index /
-            ANALYSIS_FPS
-          ),
-
-        motion:
-          round(
-            peak.value
-          )
-
-      })
+    findMotionPeaks(
+      timeline.normalized,
+      timeline.times
     );
 
-
   /*
-  ======================================================
-  STEP 6
-  SCENE CHANGES
-  ======================================================
+  Scene changes.
   */
 
   const sceneChanges =
     detectSceneChanges(
-      motionValues
+      timeline.normalized,
+      timeline.times
     );
-
-
-  const sceneChangeList =
-    sceneChanges.map(
-      item => ({
-
-        time:
-          round(
-            item.index /
-            ANALYSIS_FPS
-          ),
-
-        strength:
-          item.jump
-
-      })
-    );
-
-
-  if (
-    typeof progressCallback ===
-    "function"
-  ) {
-
-    progressCallback(
-      75
-    );
-
-  }
-
 
   /*
-  ======================================================
-  STEP 7
-  30 SECOND CANDIDATES
-  ======================================================
+  Candidates.
   */
 
   const candidates =
     createMovementCandidates(
       timeline,
       sceneChanges,
-      videoDuration
+      actualDuration
     );
 
-
-  console.log(
-    "[MOVEMENT MAX] CANDIDATES:",
-    candidates.length
-  );
-
-
   /*
-  ======================================================
-  STEP 8
-  TOP RESULTS
-  ======================================================
+  Top.
   */
 
   const top =
     getTopSeparated(
-      candidates,
-      TOP_LIMIT,
-      SEPARATION_SECONDS
+      candidates
     );
 
+  const best =
+    top.length > 0
+      ? top[0]
+      : null;
 
   /*
-  ======================================================
-  STEP 9
-  BEST
-  ======================================================
+  Global statistics.
   */
 
-  let best =
-    null;
+  const normalized =
+    timeline.normalized;
 
+  const globalAverage =
+    average(normalized);
 
-  if (
-    top.length > 0
-  ) {
+  const globalPeak =
+    normalized.length
+      ? Math.max(
+          ...normalized
+        )
+      : 0;
 
-    best =
-      top[0];
+  const globalMinimum =
+    normalized.length
+      ? Math.min(
+          ...normalized
+        )
+      : 0;
 
-  } else if (
-    candidates.length > 0
-  ) {
+  const globalVariance =
+    variance(normalized);
 
-    best =
-      [...candidates].sort(
-        (a, b) =>
-          b.score -
-          a.score
-      )[0];
+  const globalMedian =
+    median(normalized);
 
-  }
+  const globalStd =
+    standardDeviation(
+      normalized
+    );
 
+  const globalStability =
+    clamp(
+      1 -
+        globalStd /
+          Math.max(
+            globalAverage,
+            0.05
+          ),
+      0,
+      1
+    );
 
   if (
     typeof progressCallback ===
     "function"
   ) {
-
-    progressCallback(
-      100
-    );
-
+    progressCallback(100);
   }
-
-
-  console.log("");
-  console.log(
-    "======================================================"
-  );
-
-  console.log(
-    "🎬 MOVEMENT ENGINE MAX COMPLETE"
-  );
-
-  console.log(
-    "GLOBAL AVERAGE:",
-    round(
-      globalAverage
-    )
-  );
-
-  console.log(
-    "GLOBAL PEAK:",
-    round(
-      globalPeak
-    )
-  );
-
-  console.log(
-    "MOTION PEAKS:",
-    motionPeaks.length
-  );
-
-  console.log(
-    "SCENE CHANGES:",
-    sceneChangeList.length
-  );
-
-  console.log(
-    "CANDIDATES:",
-    candidates.length
-  );
-
-
-  if (
-    best
-  ) {
-
-    console.log(
-      "BEST:",
-      best.start,
-      "->",
-      best.end,
-      "SCORE:",
-      best.score
-    );
-
-  }
-
-
-  console.log(
-    "======================================================"
-  );
-
-
-  /*
-  ======================================================
-  RETURN
-  ======================================================
-  */
 
   return {
-
     engine:
-      "Movement Engine MAX V1",
+      "Movement Engine MAX V2",
 
     detector:
-      "FFmpeg frame-difference motion analysis",
+      "FFmpeg streaming frame-difference motion analysis",
+
+    analysisMode:
+      "bounded-memory streaming",
 
     duration:
       round(
-        videoDuration
+        actualDuration,
+        3
       ),
 
-    analysis: {
+    framesAnalyzed:
+      streamResult.frames,
 
-      width:
-        ANALYSIS_WIDTH,
+    analysisFPS:
+      CONFIG.fps,
 
-      height:
-        ANALYSIS_HEIGHT,
-
-      fps:
-        ANALYSIS_FPS,
-
-      frames:
-        frames.length
-
-    },
-
-    global: {
-
-      averageMotion:
+    globalMotion: {
+      average:
         round(
-          globalAverage
+          globalAverage,
+          4
         ),
 
-      peakMotion:
+      peak:
         round(
-          globalPeak
+          globalPeak,
+          4
         ),
 
-      motionAcceleration:
+      minimum:
         round(
-          globalAcceleration
+          globalMinimum,
+          4
         ),
 
-      motionStability:
+      median:
         round(
-          globalStability
+          globalMedian,
+          4
+        ),
+
+      variance:
+        round(
+          globalVariance,
+          5
+        ),
+
+      stability:
+        round(
+          globalStability,
+          4
         )
-
     },
 
-    motionPeaks:
-      motionPeaks.slice(
-        0,
-        100
-      ),
+    motionPeaks,
 
     motionPeakCount:
       motionPeaks.length,
 
-    sceneChanges:
-      sceneChangeList.slice(
-        0,
-        200
-      ),
+    sceneChanges,
 
     sceneChangeCount:
-      sceneChangeList.length,
+      sceneChanges.length,
 
     candidatesAnalyzed:
       candidates.length,
@@ -2410,56 +1610,58 @@ async function analyzeMovement(
     best,
 
     settings: {
-
       analysisWidth:
-        ANALYSIS_WIDTH,
+        CONFIG.analysisWidth,
 
       analysisHeight:
-        ANALYSIS_HEIGHT,
+        CONFIG.analysisHeight,
 
-      analysisFPS:
-        ANALYSIS_FPS,
+      fps:
+        CONFIG.fps,
+
+      sampleStep:
+        CONFIG.sampleStep,
 
       clipDuration:
-        CLIP_DURATION,
+        CONFIG.clipDuration,
 
       windowStep:
-        WINDOW_STEP,
+        CONFIG.windowStep,
 
-      sceneChangeThreshold:
-        SCENE_CHANGE_THRESHOLD,
+      sceneThreshold:
+        CONFIG.sceneThreshold,
+
+      strongSceneThreshold:
+        CONFIG.strongSceneThreshold,
+
+      motionPeakThreshold:
+        CONFIG.motionPeakThreshold,
 
       topLimit:
-        TOP_LIMIT,
+        CONFIG.topLimit,
 
       separationSeconds:
-        SEPARATION_SECONDS
+        CONFIG.separationSeconds,
 
+      memoryMode:
+        "streaming — previous/current frame only"
     }
-
   };
-
 }
 
-
-/* ======================================================
+/* =====================================================
    EXPORTS
-====================================================== */
+===================================================== */
 
 module.exports = {
-
   analyzeMovement,
-
+  getVideoInfo,
+  calculateFrameMotion,
+  smoothValues,
+  normalizeMotion,
+  findMotionPeaks,
+  detectSceneChanges,
+  scoreMovementWindow,
   createMovementCandidates,
-
-  getTopSeparated,
-
-  calculateFrameDifference,
-
-  calculateMotionAcceleration,
-
-  calculateMotionStability,
-
-  detectSceneChanges
-
+  getTopSeparated
 };
