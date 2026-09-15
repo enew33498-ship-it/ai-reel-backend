@@ -1,3 +1,5 @@
+"use strict";
+
 const express = require("express");
 const cors = require("cors");
 const multer = require("multer");
@@ -7,38 +9,31 @@ const os = require("os");
 const crypto = require("crypto");
 const { spawn } = require("child_process");
 
-// =====================================================
-// VOICE ENGINE ATTACHMENT
-// =====================================================
-
 const {
   analyzeVoice
 } = require("./voice-engine");
 
+const {
+  analyzeMovement
+} = require("./movement-engine");
 
-// =====================================================
-// APP
-// =====================================================
+/* =====================================================
+   APP
+===================================================== */
 
 const app = express();
 
+app.use(cors());
+
 app.use(
-  cors({
-    origin: "*"
+  express.json({
+    limit: "10mb"
   })
 );
 
-app.use(
-  express.json()
-);
-
-const PORT =
-  process.env.PORT || 10000;
-
-
-// =====================================================
-// DIRECTORIES
-// =====================================================
+/* =====================================================
+   DIRECTORIES
+===================================================== */
 
 const uploadDir =
   path.join(
@@ -66,334 +61,176 @@ fs.mkdirSync(
   }
 );
 
-
-// =====================================================
-// UPLOAD
-// =====================================================
-
-const storage =
-  multer.diskStorage({
-
-    destination: (
-      req,
-      file,
-      cb
-    ) => {
-
-      cb(
-        null,
-        uploadDir
-      );
-
-    },
-
-    filename: (
-      req,
-      file,
-      cb
-    ) => {
-
-      const id =
-        crypto.randomUUID();
-
-      cb(
-        null,
-        id +
-        path.extname(
-          file.originalname ||
-          ".mp4"
-        )
-      );
-
-    }
-
-  });
-
+/* =====================================================
+   MULTER
+===================================================== */
 
 const upload =
   multer({
-
-    storage,
+    dest: uploadDir,
 
     limits: {
-
       fileSize:
-        2 *
-        1024 *
-        1024 *
-        1024
-
+        2 * 1024 * 1024 * 1024
     }
-
   });
 
-
-// =====================================================
-// EXISTING MP4 JOB STORAGE
-// =====================================================
+/* =====================================================
+   JOB STORAGE
+===================================================== */
 
 const jobs =
   new Map();
 
-
-// =====================================================
-// NEW VOICE JOB STORAGE
-// =====================================================
-
 const voiceJobs =
   new Map();
 
+const movementJobs =
+  new Map();
 
-// =====================================================
-// HOME
-// =====================================================
+/* =====================================================
+   BASIC ROUTES
+===================================================== */
 
 app.get(
   "/",
   (req, res) => {
-
-    res.send(`
-      <h1>AI Reel Editor Backend</h1>
-      <p>Server is online.</p>
-      <p>Voice Engine V3 attached.</p>
-      <p>Use /health to check status.</p>
-    `);
-
+    res.json({
+      ok: true,
+      message:
+        "AI Reel Backend is running."
+    });
   }
 );
-
-
-// =====================================================
-// HEALTH
-// =====================================================
 
 app.get(
   "/health",
   (req, res) => {
-
     res.json({
-
       ok: true,
-
       service:
-        "AI Reel Editor Backend",
-
-      voiceEngine:
-        "MAX VOICE ENGINE V3",
-
-      time:
-        new Date().toISOString()
-
+        "AI Reel Backend",
+      cut:
+        "ready",
+      voice:
+        "ready",
+      movement:
+        "ready"
     });
-
   }
 );
 
+/* =====================================================
+   VIDEO DURATION
+===================================================== */
 
-// =====================================================
-// =====================================================
-// EXISTING MP4 SYSTEM
-// =====================================================
-// DO NOT BREAK THIS SECTION
-// =====================================================
+function getVideoDuration(
+  filePath
+) {
+  return new Promise(
+    (resolve, reject) => {
+      const ffprobe =
+        spawn(
+          "ffprobe",
+          [
+            "-v",
+            "error",
 
+            "-show_entries",
+            "format=duration",
 
-// =====================================================
-// CREATE CUT JOB
-// =====================================================
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
 
-app.post(
-  "/cut",
-  upload.single("video"),
-  (req, res) => {
+            filePath
+          ]
+        );
 
-    if (!req.file) {
+      let output = "";
+      let errorOutput = "";
 
-      return res.status(400).json({
-
-        ok: false,
-
-        error:
-          "No video uploaded."
-
-      });
-
-    }
-
-
-    let start =
-      Number(
-        req.body.start ||
-        0
+      ffprobe.stdout.on(
+        "data",
+        chunk => {
+          output +=
+            chunk.toString();
+        }
       );
 
-    let duration =
-      Number(
-        req.body.duration ||
-        req.body.clipDuration ||
-        30
+      ffprobe.stderr.on(
+        "data",
+        chunk => {
+          errorOutput +=
+            chunk.toString();
+        }
       );
 
-
-    if (
-      !Number.isFinite(start) ||
-      start < 0
-    ) {
-
-      start = 0;
-
-    }
-
-
-    if (
-      !Number.isFinite(duration) ||
-      duration <= 0
-    ) {
-
-      duration = 30;
-
-    }
-
-
-    // EXACT 30 SECOND MODE
-
-    duration = 30;
-
-
-    const jobId =
-      crypto.randomUUID();
-
-
-    const inputPath =
-      req.file.path;
-
-
-    const outputPath =
-      path.join(
-        outputDir,
-        `${jobId}.mp4`
+      ffprobe.on(
+        "error",
+        reject
       );
 
+      ffprobe.on(
+        "close",
+        code => {
+          if (code !== 0) {
+            reject(
+              new Error(
+                errorOutput ||
+                  "ffprobe failed."
+              )
+            );
 
-    jobs.set(
-      jobId,
-      {
+            return;
+          }
 
-        id:
-          jobId,
+          const duration =
+            Number(
+              output.trim()
+            );
 
-        status:
-          "processing",
+          if (
+            !Number.isFinite(
+              duration
+            )
+          ) {
+            reject(
+              new Error(
+                "Invalid video duration."
+              )
+            );
 
-        progress:
-          0,
+            return;
+          }
 
-        start,
+          resolve(
+            duration
+          );
+        }
+      );
+    }
+  );
+}
 
-        duration,
-
-        inputPath,
-
-        outputPath,
-
-        createdAt:
-          Date.now(),
-
-        finishedAt:
-          null,
-
-        error:
-          null
-
-      }
-    );
-
-
-    console.log("");
-
-    console.log(
-      "======================================"
-    );
-
-    console.log(
-      "[NEW CUT JOB]"
-    );
-
-    console.log(
-      "[JOB ID]",
-      jobId
-    );
-
-    console.log(
-      "[INPUT]",
-      inputPath
-    );
-
-    console.log(
-      "[START]",
-      start
-    );
-
-    console.log(
-      "[DURATION]",
-      duration
-    );
-
-    console.log(
-      "======================================"
-    );
-
-
-    startFFmpeg(
-      jobId
-    );
-
-
-    res.json({
-
-      ok:
-        true,
-
-      jobId,
-
-      message:
-        "Video processing started."
-
-    });
-
-  }
-);
-
-
-// =====================================================
-// START FFMPEG
-// =====================================================
+/* =====================================================
+   START FFMPEG
+   EXISTING MP4 CREATION
+===================================================== */
 
 function startFFmpeg(
-  jobId
+  jobId,
+  inputPath,
+  outputPath,
+  start
 ) {
-
-  const job =
-    jobs.get(jobId);
-
-  if (!job) return;
-
-
-  console.log(
-    "[FFMPEG] Starting job:",
-    jobId
-  );
-
-
   const args = [
-
     "-y",
 
     "-ss",
-    String(job.start),
+    String(start),
 
     "-i",
-    job.inputPath,
+    inputPath,
 
     "-t",
     "30",
@@ -437,20 +274,8 @@ function startFFmpeg(
     "-movflags",
     "+faststart",
 
-    job.outputPath
-
+    outputPath
   ];
-
-
-  console.log(
-    "[FFMPEG COMMAND]"
-  );
-
-  console.log(
-    "ffmpeg " +
-    args.join(" ")
-  );
-
 
   const ffmpeg =
     spawn(
@@ -458,980 +283,446 @@ function startFFmpeg(
       args
     );
 
+  jobs.set(
+    jobId,
+    {
+      status:
+        "processing",
 
-  job.ffmpeg =
-    ffmpeg;
+      progress: 0,
 
+      outputPath,
 
-  let stderrData =
-    "";
+      error: null,
 
-
-  ffmpeg.stderr.on(
-    "data",
-    (data) => {
-
-      const text =
-        data.toString();
-
-      stderrData +=
-        text;
-
-
-      const match =
-        text.match(
-          /time=(\d+):(\d+):(\d+(?:\.\d+)?)/
-        );
-
-
-      if (match) {
-
-        const hours =
-          Number(match[1]);
-
-        const minutes =
-          Number(match[2]);
-
-        const seconds =
-          Number(match[3]);
-
-
-        const current =
-          hours * 3600 +
-          minutes * 60 +
-          seconds;
-
-
-        let progress =
-          Math.round(
-            (current / 30) *
-            100
-          );
-
-
-        progress =
-          Math.max(
-            0,
-            Math.min(
-              99,
-              progress
-            )
-          );
-
-
-        job.progress =
-          progress;
-
-      }
-
+      startedAt:
+        Date.now()
     }
   );
 
+  let stderr = "";
+
+  ffmpeg.stderr.on(
+    "data",
+    chunk => {
+      stderr +=
+        chunk.toString();
+
+      const job =
+        jobs.get(jobId);
+
+      if (!job) return;
+
+      /*
+      Keep progress alive.
+      */
+
+      job.progress =
+        Math.min(
+          99,
+          job.progress + 1
+        );
+    }
+  );
 
   ffmpeg.on(
     "error",
-    (err) => {
+    error => {
+      const job =
+        jobs.get(jobId);
 
-      console.error(
-        "[FFMPEG ERROR]",
-        err
-      );
-
+      if (!job) return;
 
       job.status =
         "error";
 
       job.error =
-        err.message;
-
-      job.finishedAt =
-        Date.now();
-
-
-      cleanupInput(
-        job
-      );
-
+        error.message;
     }
   );
-
 
   ffmpeg.on(
     "close",
-    (code) => {
+    code => {
+      const job =
+        jobs.get(jobId);
 
-      console.log("");
+      if (!job) return;
 
-      console.log(
-        "[FFMPEG FINISHED]"
-      );
+      if (code === 0) {
+        job.status =
+          "ready";
 
-      console.log(
-        "[JOB]",
-        jobId
-      );
+        job.progress =
+          100;
 
-      console.log(
-        "[EXIT CODE]",
-        code
-      );
-
-
-      if (code !== 0) {
-
+        job.error =
+          null;
+      } else {
         job.status =
           "error";
 
         job.error =
-          "FFmpeg failed with exit code " +
-          code;
-
-
-        console.error(
-          "[FFMPEG FAILED]",
-          stderrData.slice(-3000)
-        );
-
-
-        cleanupInput(
-          job
-        );
-
-        return;
-
+          stderr ||
+          `FFmpeg exited with code ${code}`;
       }
-
-
-      if (
-        !fs.existsSync(
-          job.outputPath
-        )
-      ) {
-
-        job.status =
-          "error";
-
-        job.error =
-          "Output MP4 was not created.";
-
-
-        cleanupInput(
-          job
-        );
-
-        return;
-
-      }
-
-
-      const stats =
-        fs.statSync(
-          job.outputPath
-        );
-
-
-      console.log(
-        "[OUTPUT SIZE]",
-        (
-          stats.size /
-          1024 /
-          1024
-        ).toFixed(2),
-        "MB"
-      );
-
-
-      job.status =
-        "ready";
-
-      job.progress =
-        100;
-
-      job.finishedAt =
-        Date.now();
-
-
-      console.log(
-        "[JOB READY]"
-      );
-
-
-      console.log(
-        "[DOWNLOAD]",
-        `/cut/download/${jobId}`
-      );
-
-
-      cleanupInput(
-        job
-      );
-
-
-      setTimeout(
-        () => {
-
-          const currentJob =
-            jobs.get(jobId);
-
-
-          if (!currentJob) return;
-
-
-          if (
-            fs.existsSync(
-              currentJob.outputPath
-            )
-          ) {
-
-            try {
-
-              fs.unlinkSync(
-                currentJob.outputPath
-              );
-
-
-              console.log(
-                "[AUTO CLEANUP]",
-                jobId
-              );
-
-            }
-            catch (e) {
-
-              console.log(
-                "[AUTO CLEANUP ERROR]",
-                e.message
-              );
-
-            }
-
-          }
-
-
-          jobs.delete(
-            jobId
-          );
-
-
-        },
-        15 *
-        60 *
-        1000
-      );
-
     }
   );
-
 }
 
+/* =====================================================
+   CUT API
+===================================================== */
 
-// =====================================================
-// CUT STATUS
-// =====================================================
+app.post(
+  "/cut",
+  upload.single("video"),
+  async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "No video uploaded."
+        });
+      }
+
+      let start =
+        Number(
+          req.body.start
+        );
+
+      if (
+        !Number.isFinite(start)
+      ) {
+        start = 0;
+      }
+
+      start =
+        Math.max(
+          0,
+          start
+        );
+
+      const jobId =
+        crypto.randomUUID();
+
+      const outputPath =
+        path.join(
+          outputDir,
+          `${jobId}.mp4`
+        );
+
+      jobs.set(
+        jobId,
+        {
+          status:
+            "queued",
+
+          progress: 0,
+
+          outputPath,
+
+          inputPath:
+            req.file.path,
+
+          error: null,
+
+          startedAt:
+            Date.now()
+        }
+      );
+
+      startFFmpeg(
+        jobId,
+        req.file.path,
+        outputPath,
+        start
+      );
+
+      res.json({
+        ok: true,
+        jobId
+      });
+
+    } catch (error) {
+      res.status(500).json({
+        ok: false,
+        error:
+          error.message
+      });
+    }
+  }
+);
+
+/* =====================================================
+   CUT STATUS
+===================================================== */
 
 app.get(
   "/cut/status/:jobId",
   (req, res) => {
-
     const job =
       jobs.get(
         req.params.jobId
       );
 
-
     if (!job) {
-
       return res.status(404).json({
-
         ok: false,
-
         error:
-          "Job not found or expired."
-
+          "Job not found."
       });
-
     }
 
-
     res.json({
-
-      ok:
-        true,
-
-      jobId:
-        job.id,
-
+      ok: true,
       status:
         job.status,
 
       progress:
         job.progress,
 
-      duration:
-        30,
-
       error:
-        job.error ||
-        null,
-
-      downloadUrl:
-        job.status === "ready"
-          ? `/cut/download/${job.id}`
-          : null
-
+        job.error
     });
-
   }
 );
 
-
-// =====================================================
-// CUT DOWNLOAD
-// =====================================================
+/* =====================================================
+   CUT DOWNLOAD
+===================================================== */
 
 app.get(
   "/cut/download/:jobId",
   (req, res) => {
-
     const job =
       jobs.get(
         req.params.jobId
       );
 
-
     if (!job) {
-
-      return res.status(404).send(
-        "Job not found or expired."
-      );
-
+      return res.status(404).json({
+        ok: false,
+        error:
+          "Job not found."
+      });
     }
-
 
     if (
-      job.status !== "ready"
+      job.status !==
+      "ready"
     ) {
-
-      return res.status(409).send(
-        "Video is not ready yet."
-      );
-
+      return res.status(400).json({
+        ok: false,
+        error:
+          "Video is not ready."
+      });
     }
-
 
     if (
       !fs.existsSync(
         job.outputPath
       )
     ) {
-
-      return res.status(404).send(
-        "MP4 file no longer exists."
-      );
-
+      return res.status(404).json({
+        ok: false,
+        error:
+          "Output file not found."
+      });
     }
 
-
-    console.log(
-      "[DOWNLOAD REQUEST]",
-      job.id
+    res.download(
+      job.outputPath,
+      "AI_Reel_30Seconds_1080x1920.mp4"
     );
-
-
-    const filename =
-      "AI_Reel_30Seconds_1080x1920.mp4";
-
-
-    const stats =
-      fs.statSync(
-        job.outputPath
-      );
-
-
-    res.setHeader(
-      "Content-Type",
-      "video/mp4"
-    );
-
-
-    res.setHeader(
-      "Content-Length",
-      stats.size
-    );
-
-
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename="${filename}"`
-    );
-
-
-    const stream =
-      fs.createReadStream(
-        job.outputPath
-      );
-
-
-    stream.on(
-      "error",
-      (err) => {
-
-        console.error(
-          "[DOWNLOAD ERROR]",
-          err
-        );
-
-      }
-    );
-
-
-    stream.on(
-      "close",
-      () => {
-
-        console.log(
-          "[DOWNLOAD STREAM CLOSED]",
-          job.id
-        );
-
-
-        setTimeout(
-          () => {
-
-            try {
-
-              if (
-                fs.existsSync(
-                  job.outputPath
-                )
-              ) {
-
-                fs.unlinkSync(
-                  job.outputPath
-                );
-
-
-                console.log(
-                  "[OUTPUT DELETED]",
-                  job.id
-                );
-
-              }
-
-
-              jobs.delete(
-                job.id
-              );
-
-            }
-            catch (e) {
-
-              console.log(
-                "[DELETE ERROR]",
-                e.message
-              );
-
-            }
-
-          },
-          3000
-        );
-
-      }
-    );
-
-
-    stream.pipe(
-      res
-    );
-
   }
 );
 
-
-// =====================================================
-// =====================================================
-// MAX VOICE ENGINE API
-// =====================================================
-// =====================================================
-
-
-// =====================================================
-// GET VIDEO DURATION USING FFPROBE
-// =====================================================
-
-function getVideoDuration(
-  videoPath
-) {
-
-  return new Promise(
-    (resolve, reject) => {
-
-      const ffprobe =
-        spawn(
-          "ffprobe",
-          [
-            "-v",
-            "error",
-
-            "-show_entries",
-            "format=duration",
-
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-
-            videoPath
-          ]
-        );
-
-
-      let output =
-        "";
-
-      let errorText =
-        "";
-
-
-      ffprobe.stdout.on(
-        "data",
-        (data) => {
-
-          output +=
-            data.toString();
-
-        }
-      );
-
-
-      ffprobe.stderr.on(
-        "data",
-        (data) => {
-
-          errorText +=
-            data.toString();
-
-        }
-      );
-
-
-      ffprobe.on(
-        "error",
-        reject
-      );
-
-
-      ffprobe.on(
-        "close",
-        (code) => {
-
-          if (code !== 0) {
-
-            reject(
-              new Error(
-                "FFprobe failed: " +
-                errorText
-              )
-            );
-
-            return;
-
-          }
-
-
-          const duration =
-            Number(
-              output.trim()
-            );
-
-
-          if (
-            !Number.isFinite(
-              duration
-            ) ||
-            duration <= 0
-          ) {
-
-            reject(
-              new Error(
-                "Could not detect video duration."
-              )
-            );
-
-            return;
-
-          }
-
-
-          resolve(
-            duration
-          );
-
-        }
-      );
-
-    }
-  );
-
-}
-
-
-// =====================================================
-// VOICE ANALYZE
-// =====================================================
+/* =====================================================
+   VOICE ANALYSIS
+===================================================== */
 
 app.post(
   "/voice/analyze",
   upload.single("video"),
   async (req, res) => {
-
-    if (!req.file) {
-
-      return res.status(400).json({
-
-        ok: false,
-
-        error:
-          "No video uploaded."
-
-      });
-
-    }
-
-
-    const inputPath =
-      req.file.path;
-
-
-    let duration =
-      Number(
-        req.body.duration
-      );
-
-
     try {
-
-      if (
-        !Number.isFinite(
-          duration
-        ) ||
-        duration <= 0
-      ) {
-
-        console.log(
-          "[VOICE] Duration not supplied. Using FFprobe."
-        );
-
-
-        duration =
-          await getVideoDuration(
-            inputPath
-          );
-
+      if (!req.file) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "No video uploaded."
+        });
       }
 
+      const duration =
+        await getVideoDuration(
+          req.file.path
+        );
 
       const jobId =
         crypto.randomUUID();
 
-
       voiceJobs.set(
         jobId,
         {
-
-          id:
-            jobId,
-
           status:
-            "processing",
+            "queued",
 
-          progress:
-            0,
+          progress: 0,
 
           message:
-            "Starting voice analysis...",
+            "Voice analysis queued.",
+
+          inputPath:
+            req.file.path,
 
           duration,
 
-          inputPath,
+          result: null,
 
-          result:
-            null,
+          error: null,
 
-          error:
-            null,
-
-          createdAt:
-            Date.now(),
-
-          finishedAt:
-            null
-
+          startedAt:
+            Date.now()
         }
       );
-
-
-      console.log("");
-
-      console.log(
-        "======================================"
-      );
-
-      console.log(
-        "[NEW VOICE JOB]"
-      );
-
-      console.log(
-        "[JOB ID]",
-        jobId
-      );
-
-      console.log(
-        "[DURATION]",
-        duration
-      );
-
-      console.log(
-        "======================================"
-      );
-
 
       runVoiceJob(
         jobId
       );
 
-
       res.json({
-
-        ok:
-          true,
-
+        ok: true,
         jobId,
-
-        message:
-          "Voice analysis started."
-
+        status:
+          "queued",
+        duration
       });
 
-    }
-    catch (error) {
+    } catch (error) {
+      if (
+        req.file &&
+        req.file.path
+      ) {
+        cleanupVoiceFile(
+          req.file.path
+        );
+      }
 
-      cleanupVoiceFile(
-        inputPath
-      );
-
-
-      return res.status(500).json({
-
+      res.status(500).json({
         ok: false,
-
         error:
           error.message
-
       });
-
     }
-
   }
 );
 
-
-// =====================================================
-// RUN VOICE JOB
-// =====================================================
+/* =====================================================
+   RUN VOICE JOB
+===================================================== */
 
 async function runVoiceJob(
   jobId
 ) {
-
   const job =
     voiceJobs.get(
       jobId
     );
 
-
   if (!job) return;
 
-
   try {
+    job.status =
+      "processing";
+
+    job.message =
+      "Running Voice Engine MAX...";
 
     const result =
       await analyzeVoice(
-
         job.inputPath,
-
         job.duration,
-
-        (
-          progress,
-          message
-        ) => {
-
-          job.progress =
-            Math.max(
-              0,
-              Math.min(
-                99,
-                Number(progress) || 0
-              )
+        progress => {
+          const current =
+            voiceJobs.get(
+              jobId
             );
 
+          if (!current) return;
 
-          job.message =
-            message ||
-            "Analyzing voice...";
-
-
-          console.log(
-            `[VOICE ${jobId}]`,
-            job.progress + "%",
-            job.message
-          );
-
+          current.progress =
+            Math.min(
+              99,
+              Number(
+                progress
+              ) || 0
+            );
         }
-
       );
-
-
-    job.result =
-      result;
-
-
-    job.progress =
-      100;
-
-
-    job.message =
-      "Voice analysis complete.";
-
 
     job.status =
       "ready";
 
+    job.progress =
+      100;
 
-    job.finishedAt =
-      Date.now();
+    job.message =
+      "Voice analysis complete.";
 
-
-    console.log("");
-
-    console.log(
-      "[VOICE JOB READY]"
-    );
-
-    console.log(
-      "[JOB]",
-      jobId
-    );
-
-
-    if (
-      result.best
-    ) {
-
-      console.log(
-        "[BEST VOICE]",
-        result.best.start,
-        "to",
-        result.best.end
-      );
-
-      console.log(
-        "[VOICE SCORE]",
-        result.best.score
-      );
-
-    }
-
+    job.result =
+      result;
 
     cleanupVoiceFile(
       job.inputPath
     );
 
-
-    // Delete job after 15 minutes
-
-    setTimeout(
-      () => {
-
-        voiceJobs.delete(
-          jobId
-        );
-
-      },
-      15 *
-      60 *
-      1000
-    );
-
-  }
-  catch (error) {
-
-    console.error(
-      "[VOICE ENGINE ERROR]",
-      error
-    );
-
-
+  } catch (error) {
     job.status =
       "error";
 
-
-    job.error =
-      error.message;
-
+    job.progress =
+      100;
 
     job.message =
       "Voice analysis failed.";
 
-
-    job.finishedAt =
-      Date.now();
-
+    job.error =
+      error.message;
 
     cleanupVoiceFile(
       job.inputPath
     );
-
   }
-
 }
 
-
-// =====================================================
-// VOICE STATUS
-// =====================================================
+/* =====================================================
+   VOICE STATUS
+===================================================== */
 
 app.get(
   "/voice/status/:jobId",
   (req, res) => {
-
     const job =
       voiceJobs.get(
         req.params.jobId
       );
 
-
     if (!job) {
-
       return res.status(404).json({
-
         ok: false,
-
         error:
-          "Voice job not found or expired."
-
+          "Voice job not found."
       });
-
     }
 
-
     res.json({
-
-      ok:
-        true,
+      ok: true,
 
       jobId:
-        job.id,
+        req.params.jobId,
 
       status:
         job.status,
@@ -1446,211 +737,405 @@ app.get(
         job.duration,
 
       error:
-        job.error ||
-        null,
+        job.error,
 
       result:
-        job.status === "ready"
-          ? job.result
-          : null
-
+        job.result
     });
-
   }
 );
 
-
-// =====================================================
-// CLEAN VOICE INPUT
-// =====================================================
+/* =====================================================
+   VOICE CLEANUP
+===================================================== */
 
 function cleanupVoiceFile(
-  inputPath
+  filePath
 ) {
-
-  if (!inputPath) return;
-
-
   try {
-
     if (
+      filePath &&
       fs.existsSync(
-        inputPath
+        filePath
       )
     ) {
-
       fs.unlinkSync(
-        inputPath
+        filePath
       );
-
-
-      console.log(
-        "[VOICE INPUT DELETED]",
-        inputPath
-      );
-
     }
-
-  }
-  catch (error) {
-
-    console.log(
-      "[VOICE INPUT DELETE ERROR]",
-      error.message
-    );
-
-  }
-
+  } catch {}
 }
 
+/* =====================================================
+   MOVEMENT ANALYSIS
+===================================================== */
 
-// =====================================================
-// EXISTING CLEAN INPUT
-// =====================================================
+app.post(
+  "/movement/analyze",
+  upload.single("video"),
+  async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "No video uploaded."
+        });
+      }
 
-function cleanupInput(
-  job
-) {
+      const duration =
+        await getVideoDuration(
+          req.file.path
+        );
 
-  if (
-    !job ||
-    !job.inputPath
-  ) {
+      const jobId =
+        crypto.randomUUID();
 
-    return;
+      movementJobs.set(
+        jobId,
+        {
+          status:
+            "queued",
 
-  }
+          progress: 0,
 
+          message:
+            "Movement analysis queued.",
 
-  try {
+          inputPath:
+            req.file.path,
 
-    if (
-      fs.existsSync(
-        job.inputPath
-      )
-    ) {
+          duration,
 
-      fs.unlinkSync(
-        job.inputPath
+          result: null,
+
+          error: null,
+
+          startedAt:
+            Date.now()
+        }
       );
 
-
-      console.log(
-        "[INPUT DELETED]",
-        job.inputPath
+      runMovementJob(
+        jobId
       );
 
-    }
+      res.json({
+        ok: true,
 
-  }
-  catch (err) {
+        jobId,
 
-    console.log(
-      "[INPUT DELETE ERROR]",
-      err.message
-    );
+        status:
+          "queued",
 
-  }
-
-}
-
-
-// =====================================================
-// MULTER ERROR
-// =====================================================
-
-app.use(
-  (
-    err,
-    req,
-    res,
-    next
-  ) => {
-
-    console.error(
-      "[SERVER ERROR]",
-      err
-    );
-
-
-    if (
-      err instanceof
-      multer.MulterError
-    ) {
-
-      return res.status(400).json({
-
-        ok: false,
-
-        error:
-          err.message
-
+        duration
       });
 
+    } catch (error) {
+      if (
+        req.file &&
+        req.file.path
+      ) {
+        cleanupMovementFile(
+          req.file.path
+        );
+      }
+
+      res.status(500).json({
+        ok: false,
+        error:
+          error.message
+      });
     }
-
-
-    res.status(500).json({
-
-      ok: false,
-
-      error:
-        err.message ||
-        "Internal server error."
-
-    });
-
   }
 );
 
+/* =====================================================
+   RUN MOVEMENT JOB
+===================================================== */
 
-// =====================================================
-// SERVER
-// =====================================================
+async function runMovementJob(
+  jobId
+) {
+  const job =
+    movementJobs.get(
+      jobId
+    );
+
+  if (!job) return;
+
+  try {
+    job.status =
+      "processing";
+
+    job.message =
+      "Running Movement Engine MAX...";
+
+    const result =
+      await analyzeMovement(
+        job.inputPath,
+        job.duration,
+        progress => {
+          const current =
+            movementJobs.get(
+              jobId
+            );
+
+          if (!current) return;
+
+          current.progress =
+            Math.min(
+              99,
+              Number(
+                progress
+              ) || 0
+            );
+
+          current.message =
+            `Movement analysis ${current.progress}%`;
+        }
+      );
+
+    job.status =
+      "ready";
+
+    job.progress =
+      100;
+
+    job.message =
+      "Movement analysis complete.";
+
+    job.result =
+      result;
+
+    cleanupMovementFile(
+      job.inputPath
+    );
+
+  } catch (error) {
+    job.status =
+      "error";
+
+    job.progress =
+      100;
+
+    job.message =
+      "Movement analysis failed.";
+
+    job.error =
+      error.message;
+
+    cleanupMovementFile(
+      job.inputPath
+    );
+  }
+}
+
+/* =====================================================
+   MOVEMENT STATUS
+===================================================== */
+
+app.get(
+  "/movement/status/:jobId",
+  (req, res) => {
+    const job =
+      movementJobs.get(
+        req.params.jobId
+      );
+
+    if (!job) {
+      return res.status(404).json({
+        ok: false,
+        error:
+          "Movement job not found."
+      });
+    }
+
+    res.json({
+      ok: true,
+
+      jobId:
+        req.params.jobId,
+
+      status:
+        job.status,
+
+      progress:
+        job.progress,
+
+      message:
+        job.message,
+
+      duration:
+        job.duration,
+
+      error:
+        job.error,
+
+      result:
+        job.result
+    });
+  }
+);
+
+/* =====================================================
+   MOVEMENT CLEANUP
+===================================================== */
+
+function cleanupMovementFile(
+  filePath
+) {
+  try {
+    if (
+      filePath &&
+      fs.existsSync(
+        filePath
+      )
+    ) {
+      fs.unlinkSync(
+        filePath
+      );
+    }
+  } catch {}
+}
+
+/* =====================================================
+   CLEANUP OLD JOBS
+===================================================== */
+
+setInterval(
+  () => {
+    const now =
+      Date.now();
+
+    const maxAge =
+      60 *
+      60 *
+      1000;
+
+    for (
+      const [
+        jobId,
+        job
+      ] of jobs
+    ) {
+      if (
+        now -
+          job.startedAt >
+        maxAge
+      ) {
+        try {
+          if (
+            job.outputPath &&
+            fs.existsSync(
+              job.outputPath
+            )
+          ) {
+            fs.unlinkSync(
+              job.outputPath
+            );
+          }
+        } catch {}
+
+        try {
+          if (
+            job.inputPath &&
+            fs.existsSync(
+              job.inputPath
+            )
+          ) {
+            fs.unlinkSync(
+              job.inputPath
+            );
+          }
+        } catch {}
+
+        jobs.delete(
+          jobId
+        );
+      }
+    }
+
+    for (
+      const [
+        jobId,
+        job
+      ] of voiceJobs
+    ) {
+      if (
+        now -
+          job.startedAt >
+        maxAge
+      ) {
+        cleanupVoiceFile(
+          job.inputPath
+        );
+
+        voiceJobs.delete(
+          jobId
+        );
+      }
+    }
+
+    for (
+      const [
+        jobId,
+        job
+      ] of movementJobs
+    ) {
+      if (
+        now -
+          job.startedAt >
+        maxAge
+      ) {
+        cleanupMovementFile(
+          job.inputPath
+        );
+
+        movementJobs.delete(
+          jobId
+        );
+      }
+    }
+  },
+  10 * 60 * 1000
+);
+
+/* =====================================================
+   SERVER
+===================================================== */
+
+const PORT =
+  process.env.PORT ||
+  10000;
 
 const server =
   app.listen(
     PORT,
     () => {
-
-      console.log("");
-
       console.log(
-        "======================================"
+        `AI Reel Backend running on port ${PORT}`
       );
 
       console.log(
-        "AI REEL BACKEND RUNNING"
+        "CUT ENGINE: READY"
       );
 
       console.log(
-        "PORT:",
-        PORT
+        "VOICE ENGINE: READY"
       );
 
       console.log(
-        "VOICE ENGINE:",
-        "MAX VOICE ENGINE V3"
+        "MOVEMENT ENGINE MAX V2: READY"
       );
-
-      console.log(
-        "======================================"
-
-      );
-
     }
   );
 
-
-// =====================================================
-// LONG PROCESSING TIMEOUTS
-// =====================================================
-
 server.timeout =
-  0;
-
-server.requestTimeout =
-  0;
+  30 * 60 * 1000;
 
 server.keepAliveTimeout =
-  120000;
+  30 * 60 * 1000;
+
+server.headersTimeout =
+  30 * 60 * 1000;
