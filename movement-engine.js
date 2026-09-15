@@ -2,8 +2,9 @@
 
 /*
 =========================================================
- MOVEMENT ENGINE MAX
- Version: 2.0
+ MOVEMENT ENGINE MAX V3
+ =========================================================
+
  Purpose:
  - Analyze real uploaded video
  - Detect visual movement/activity
@@ -20,15 +21,13 @@
  - Does NOT create MP4
  - Does NOT modify /cut
  - Does NOT modify Voice Engine
- - Streams video frames instead of storing the entire video
- - Designed for long videos
+ - Uses bounded-memory frame streaming
+ - Optimized for long videos
+ - Uses prefix sums for fast window scoring
 =========================================================
 */
 
 const fs = require("fs");
-const os = require("os");
-const path = require("path");
-const crypto = require("crypto");
 const { spawn } = require("child_process");
 
 /* =====================================================
@@ -58,7 +57,16 @@ const CONFIG = {
 
   maxAnalysisFrames: 1000000,
 
-  tempPrefix: "movement-max-"
+  /*
+  Safety:
+  Maximum allowed FFmpeg analysis time.
+
+  For very long videos we allow generous time,
+  but we never let a broken FFmpeg process hang forever.
+  */
+  timeoutBaseMs: 10 * 60 * 1000,
+
+  timeoutPerVideoMinuteMs: 20 * 1000
 };
 
 /* =====================================================
@@ -67,24 +75,43 @@ const CONFIG = {
 
 function safeNumber(value, fallback = 0) {
   const n = Number(value);
-  return Number.isFinite(n) ? n : fallback;
+
+  return Number.isFinite(n)
+    ? n
+    : fallback;
 }
 
 function clamp(value, min = 0, max = 1) {
-  return Math.max(min, Math.min(max, value));
+  return Math.max(
+    min,
+    Math.min(max, value)
+  );
 }
 
 function round(value, digits = 4) {
   const p = Math.pow(10, digits);
-  return Math.round(value * p) / p;
+
+  return (
+    Math.round(value * p) /
+    p
+  );
 }
 
 function average(values) {
-  if (!values || values.length === 0) return 0;
+  if (
+    !values ||
+    values.length === 0
+  ) {
+    return 0;
+  }
 
   let total = 0;
 
-  for (let i = 0; i < values.length; i++) {
+  for (
+    let i = 0;
+    i < values.length;
+    i++
+  ) {
     total += values[i];
   }
 
@@ -92,127 +119,207 @@ function average(values) {
 }
 
 function variance(values) {
-  if (!values || values.length < 2) return 0;
+  if (
+    !values ||
+    values.length < 2
+  ) {
+    return 0;
+  }
 
-  const avg = average(values);
+  const avg =
+    average(values);
 
   let total = 0;
 
-  for (let i = 0; i < values.length; i++) {
-    const d = values[i] - avg;
+  for (
+    let i = 0;
+    i < values.length;
+    i++
+  ) {
+    const d =
+      values[i] - avg;
+
     total += d * d;
   }
 
-  return total / values.length;
+  return (
+    total /
+    values.length
+  );
 }
 
 function standardDeviation(values) {
-  return Math.sqrt(variance(values));
+  return Math.sqrt(
+    variance(values)
+  );
 }
 
 function percentile(values, p) {
-  if (!values || values.length === 0) return 0;
+  if (
+    !values ||
+    values.length === 0
+  ) {
+    return 0;
+  }
 
-  const sorted = values.slice().sort((a, b) => a - b);
+  const sorted =
+    values
+      .slice()
+      .sort(
+        (a, b) => a - b
+      );
 
-  const index = (sorted.length - 1) * p;
+  const index =
+    (sorted.length - 1) * p;
 
-  const lower = Math.floor(index);
-  const upper = Math.ceil(index);
+  const lower =
+    Math.floor(index);
 
-  if (lower === upper) {
+  const upper =
+    Math.ceil(index);
+
+  if (
+    lower === upper
+  ) {
     return sorted[lower];
   }
 
-  const weight = index - lower;
+  const weight =
+    index - lower;
 
   return (
-    sorted[lower] * (1 - weight) +
-    sorted[upper] * weight
+    sorted[lower] *
+      (1 - weight) +
+    sorted[upper] *
+      weight
   );
 }
 
 function median(values) {
-  return percentile(values, 0.5);
+  return percentile(
+    values,
+    0.5
+  );
 }
 
 /* =====================================================
    COMMAND RUNNER
 ===================================================== */
 
-function runCommand(command, args, options = {}) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, args, {
-      windowsHide: true,
-      ...options
-    });
-
-    let stdout = "";
-    let stderr = "";
-
-    child.stdout.on("data", chunk => {
-      stdout += chunk.toString();
-    });
-
-    child.stderr.on("data", chunk => {
-      stderr += chunk.toString();
-    });
-
-    child.on("error", reject);
-
-    child.on("close", code => {
-      if (code === 0) {
-        resolve({
-          stdout,
-          stderr
-        });
-      } else {
-        reject(
-          new Error(
-            `${command} exited with code ${code}\n${stderr}`
-          )
+function runCommand(
+  command,
+  args,
+  options = {}
+) {
+  return new Promise(
+    (resolve, reject) => {
+      const child =
+        spawn(
+          command,
+          args,
+          {
+            windowsHide: true,
+            ...options
+          }
         );
-      }
-    });
-  });
+
+      let stdout = "";
+      let stderr = "";
+
+      child.stdout.on(
+        "data",
+        chunk => {
+          stdout +=
+            chunk.toString();
+        }
+      );
+
+      child.stderr.on(
+        "data",
+        chunk => {
+          stderr +=
+            chunk.toString();
+        }
+      );
+
+      child.on(
+        "error",
+        reject
+      );
+
+      child.on(
+        "close",
+        code => {
+          if (
+            code === 0
+          ) {
+            resolve({
+              stdout,
+              stderr
+            });
+
+            return;
+          }
+
+          reject(
+            new Error(
+              `${command} exited with code ${code}\n${stderr}`
+            )
+          );
+        }
+      );
+    }
+  );
 }
 
 /* =====================================================
    VIDEO INFO
 ===================================================== */
 
-async function getVideoInfo(videoPath) {
-  const result = await runCommand("ffprobe", [
-    "-v",
-    "error",
+async function getVideoInfo(
+  videoPath
+) {
+  const result =
+    await runCommand(
+      "ffprobe",
+      [
+        "-v",
+        "error",
 
-    "-show_entries",
-    "format=duration",
+        "-show_entries",
+        "format=duration",
 
-    "-show_entries",
-    "stream=width,height,r_frame_rate",
+        "-show_entries",
+        "stream=width,height,r_frame_rate,codec_name",
 
-    "-of",
-    "json",
+        "-of",
+        "json",
 
-    videoPath
-  ]);
+        videoPath
+      ]
+    );
 
-  let data;
+  let data = {};
 
   try {
-    data = JSON.parse(result.stdout);
+    data =
+      JSON.parse(
+        result.stdout
+      );
   } catch {
     data = {};
   }
 
-  const duration = safeNumber(
-    data?.format?.duration,
-    0
-  );
+  const duration =
+    safeNumber(
+      data?.format?.duration,
+      0
+    );
 
   const videoStream =
-    Array.isArray(data.streams)
+    Array.isArray(
+      data.streams
+    )
       ? data.streams.find(
           stream =>
             stream.width &&
@@ -222,8 +329,22 @@ async function getVideoInfo(videoPath) {
 
   return {
     duration,
-    width: safeNumber(videoStream?.width, 0),
-    height: safeNumber(videoStream?.height, 0)
+
+    width:
+      safeNumber(
+        videoStream?.width,
+        0
+      ),
+
+    height:
+      safeNumber(
+        videoStream?.height,
+        0
+      ),
+
+    codec:
+      videoStream?.codec_name ||
+      null
   };
 }
 
@@ -231,75 +352,126 @@ async function getVideoInfo(videoPath) {
    FRAME MOTION
 ===================================================== */
 
-/*
-We compare sampled pixels from previous frame
-and current frame.
-
-Instead of keeping every frame, only two frames
-exist in memory.
-*/
-
 function calculateFrameMotion(
   previousFrame,
   currentFrame
 ) {
-  if (!previousFrame || !currentFrame) {
+  if (
+    !previousFrame ||
+    !currentFrame
+  ) {
     return 0;
   }
 
-  const length = Math.min(
-    previousFrame.length,
-    currentFrame.length
-  );
+  const length =
+    Math.min(
+      previousFrame.length,
+      currentFrame.length
+    );
 
   let totalDifference = 0;
   let samples = 0;
 
-  const step = CONFIG.sampleStep;
+  const step =
+    Math.max(
+      1,
+      CONFIG.sampleStep
+    );
 
   for (
     let i = 0;
     i < length;
     i += step
   ) {
-    const a = previousFrame[i];
-    const b = currentFrame[i];
+    const a =
+      previousFrame[i];
 
-    totalDifference += Math.abs(a - b) / 255;
+    const b =
+      currentFrame[i];
+
+    totalDifference +=
+      Math.abs(
+        a - b
+      ) / 255;
 
     samples++;
   }
 
-  if (samples === 0) return 0;
+  if (
+    samples === 0
+  ) {
+    return 0;
+  }
 
-  return totalDifference / samples;
+  return (
+    totalDifference /
+    samples
+  );
 }
 
 /* =====================================================
    SMOOTH
 ===================================================== */
 
-function smoothValues(values, radius = 2) {
-  if (!values.length) return [];
+function smoothValues(
+  values,
+  radius = 2
+) {
+  if (
+    !values.length
+  ) {
+    return [];
+  }
 
-  const result = new Array(values.length);
-
-  for (let i = 0; i < values.length; i++) {
-    const start = Math.max(0, i - radius);
-    const end = Math.min(
-      values.length - 1,
-      i + radius
+  const result =
+    new Array(
+      values.length
     );
 
-    let total = 0;
-    let count = 0;
+  /*
+  Prefix sum makes smoothing O(n)
+  instead of nested loops.
+  */
 
-    for (let j = start; j <= end; j++) {
-      total += values[j];
-      count++;
-    }
+  const prefix =
+    new Float64Array(
+      values.length + 1
+    );
 
-    result[i] = total / count;
+  for (
+    let i = 0;
+    i < values.length;
+    i++
+  ) {
+    prefix[i + 1] =
+      prefix[i] +
+      values[i];
+  }
+
+  for (
+    let i = 0;
+    i < values.length;
+    i++
+  ) {
+    const start =
+      Math.max(
+        0,
+        i - radius
+      );
+
+    const end =
+      Math.min(
+        values.length - 1,
+        i + radius
+      );
+
+    const total =
+      prefix[end + 1] -
+      prefix[start];
+
+    result[i] =
+      total /
+      (end - start + 1);
   }
 
   return result;
@@ -309,12 +481,32 @@ function smoothValues(values, radius = 2) {
    NORMALIZE MOTION
 ===================================================== */
 
-function normalizeMotion(values) {
-  if (!values.length) return [];
+function normalizeMotion(
+  values
+) {
+  if (
+    !values.length
+  ) {
+    return [];
+  }
 
-  const p50 = percentile(values, 0.50);
-  const p90 = percentile(values, 0.90);
-  const p98 = percentile(values, 0.98);
+  const p50 =
+    percentile(
+      values,
+      0.50
+    );
+
+  const p90 =
+    percentile(
+      values,
+      0.90
+    );
+
+  const p98 =
+    percentile(
+      values,
+      0.98
+    );
 
   const scale =
     Math.max(
@@ -322,31 +514,36 @@ function normalizeMotion(values) {
       0.000001
     );
 
-  return values.map(value => {
-    let normalized =
-      (value - p50) / scale;
+  return values.map(
+    value => {
+      let normalized =
+        (value - p50) /
+        scale;
 
-    normalized =
-      clamp(normalized, 0, 1);
-
-    /*
-    Extra emphasis for exceptional movement.
-    */
-
-    if (value >= p98) {
       normalized =
-        Math.min(
-          1,
-          normalized * 1.12
+        clamp(
+          normalized,
+          0,
+          1
         );
-    }
 
-    return normalized;
-  });
+      if (
+        value >= p98
+      ) {
+        normalized =
+          Math.min(
+            1,
+            normalized * 1.12
+          );
+      }
+
+      return normalized;
+    }
+  );
 }
 
 /* =====================================================
-   FRAME STREAM ANALYSIS
+   STREAM VIDEO FRAMES
 ===================================================== */
 
 async function streamMotionFrames(
@@ -354,170 +551,319 @@ async function streamMotionFrames(
   duration,
   progressCallback
 ) {
-  return new Promise((resolve, reject) => {
-    const frameSize =
-      CONFIG.analysisWidth *
-      CONFIG.analysisHeight;
+  return new Promise(
+    (resolve, reject) => {
+      const frameSize =
+        CONFIG.analysisWidth *
+        CONFIG.analysisHeight;
 
-    const ffmpegArgs = [
-      "-hide_banner",
-      "-loglevel",
-      "error",
+      const ffmpegArgs = [
+        "-hide_banner",
+        "-loglevel",
+        "error",
 
-      "-i",
-      videoPath,
+        /*
+        Important for server environments.
+        Prevent FFmpeg from waiting for stdin.
+        */
 
-      "-an",
+        "-nostdin",
 
-      "-vf",
-      `fps=${CONFIG.fps},scale=${CONFIG.analysisWidth}:${CONFIG.analysisHeight}:flags=fast_bilinear,format=gray`,
+        "-i",
+        videoPath,
 
-      "-f",
-      "rawvideo",
+        "-an",
 
-      "-pix_fmt",
-      "gray",
+        "-vf",
+        `fps=${CONFIG.fps},scale=${CONFIG.analysisWidth}:${CONFIG.analysisHeight}:flags=fast_bilinear,format=gray`,
 
-      "pipe:1"
-    ];
+        "-f",
+        "rawvideo",
 
-    const child = spawn(
-      "ffmpeg",
-      ffmpegArgs,
-      {
-        windowsHide: true
-      }
-    );
+        "-pix_fmt",
+        "gray",
 
-    let buffer = Buffer.alloc(0);
+        "pipe:1"
+      ];
 
-    let previousFrame = null;
+      const child =
+        spawn(
+          "ffmpeg",
+          ffmpegArgs,
+          {
+            windowsHide: true,
 
-    const rawMotion = [];
+            stdio: [
+              "ignore",
+              "pipe",
+              "pipe"
+            ]
+          }
+        );
 
-    let frameIndex = 0;
+      let buffer =
+        Buffer.alloc(0);
 
-    let lastProgress = 0;
+      let previousFrame =
+        null;
 
-    child.stdout.on("data", chunk => {
-      buffer = Buffer.concat([
-        buffer,
-        chunk
-      ]);
+      const rawMotion =
+        [];
 
-      while (
-        buffer.length >= frameSize
-      ) {
-        const frame =
-          buffer.subarray(
-            0,
-            frameSize
-          );
+      let frameIndex = 0;
 
-        buffer =
-          buffer.subarray(
-            frameSize
-          );
+      let lastProgress = 0;
 
-        const currentFrame =
-          Buffer.from(frame);
+      let finished = false;
 
-        if (previousFrame) {
-          const motion =
-            calculateFrameMotion(
-              previousFrame,
-              currentFrame
-            );
+      let stderr = "";
 
-          rawMotion.push(motion);
-        }
+      /*
+      Safety timeout.
+      */
 
-        previousFrame =
-          currentFrame;
+      const timeoutMs =
+        Math.max(
+          CONFIG.timeoutBaseMs,
 
-        frameIndex++;
-
-        if (
-          frameIndex >
-          CONFIG.maxAnalysisFrames
-        ) {
-          child.kill("SIGKILL");
-
-          reject(
-            new Error(
-              "Movement analysis frame limit exceeded."
+          CONFIG.timeoutPerVideoMinuteMs *
+            Math.max(
+              1,
+              duration / 60
             )
-          );
+        );
 
+      const timeout =
+        setTimeout(
+          () => {
+            if (finished) {
+              return;
+            }
+
+            finished = true;
+
+            try {
+              child.kill(
+                "SIGKILL"
+              );
+            } catch {}
+
+            reject(
+              new Error(
+                `Movement FFmpeg analysis timed out after ${Math.round(
+                  timeoutMs / 60000
+                )} minutes.`
+              )
+            );
+          },
+          timeoutMs
+        );
+
+      function fail(error) {
+        if (finished) {
           return;
         }
 
-        if (
-          duration > 0 &&
-          frameIndex % 20 === 0
-        ) {
-          const currentTime =
-            frameIndex /
-            CONFIG.fps;
+        finished = true;
 
-          const progress =
-            Math.min(
-              95,
-              Math.round(
-                (currentTime /
-                  duration) *
-                  95
-              )
-            );
+        clearTimeout(
+          timeout
+        );
 
-          if (
-            progress >
-            lastProgress
+        reject(error);
+      }
+
+      child.stdout.on(
+        "data",
+        chunk => {
+          if (finished) {
+            return;
+          }
+
+          buffer =
+            Buffer.concat([
+              buffer,
+              chunk
+            ]);
+
+          while (
+            buffer.length >=
+            frameSize
           ) {
-            lastProgress =
-              progress;
+            if (finished) {
+              return;
+            }
+
+            const frame =
+              buffer.subarray(
+                0,
+                frameSize
+              );
+
+            buffer =
+              buffer.subarray(
+                frameSize
+              );
+
+            /*
+            Copy current frame so the
+            underlying pipe buffer can move.
+            */
+
+            const currentFrame =
+              Buffer.from(
+                frame
+              );
 
             if (
-              typeof progressCallback ===
-              "function"
+              previousFrame
             ) {
-              progressCallback(
-                progress
+              const motion =
+                calculateFrameMotion(
+                  previousFrame,
+                  currentFrame
+                );
+
+              rawMotion.push(
+                motion
               );
+            }
+
+            previousFrame =
+              currentFrame;
+
+            frameIndex++;
+
+            if (
+              frameIndex >
+              CONFIG.maxAnalysisFrames
+            ) {
+              fail(
+                new Error(
+                  "Movement analysis frame limit exceeded."
+                )
+              );
+
+              try {
+                child.kill(
+                  "SIGKILL"
+                );
+              } catch {}
+
+              return;
+            }
+
+            /*
+            Progress is based on actual
+            video time represented by frames.
+            */
+
+            if (
+              duration > 0 &&
+              frameIndex % 8 === 0
+            ) {
+              const currentTime =
+                frameIndex /
+                CONFIG.fps;
+
+              const progress =
+                Math.min(
+                  95,
+                  Math.round(
+                    (
+                      currentTime /
+                      duration
+                    ) *
+                      95
+                  )
+                );
+
+              if (
+                progress >
+                lastProgress
+              ) {
+                lastProgress =
+                  progress;
+
+                if (
+                  typeof progressCallback ===
+                  "function"
+                ) {
+                  progressCallback(
+                    progress
+                  );
+                }
+              }
             }
           }
         }
-      }
-    });
+      );
 
-    let stderr = "";
+      child.stderr.on(
+        "data",
+        chunk => {
+          stderr +=
+            chunk.toString();
 
-    child.stderr.on(
-      "data",
-      chunk => {
-        stderr += chunk.toString();
-      }
-    );
+          /*
+          Keep stderr bounded.
+          FFmpeg should normally produce
+          almost nothing with -loglevel error.
+          */
 
-    child.on("error", reject);
+          if (
+            stderr.length >
+            50000
+          ) {
+            stderr =
+              stderr.slice(
+                -50000
+              );
+          }
+        }
+      );
 
-    child.on("close", code => {
-      if (code !== 0) {
-        reject(
-          new Error(
-            `FFmpeg movement analysis failed: ${stderr}`
-          )
-        );
+      child.on(
+        "error",
+        error => {
+          fail(error);
+        }
+      );
 
-        return;
-      }
+      child.on(
+        "close",
+        code => {
+          if (finished) {
+            return;
+          }
 
-      resolve({
-        rawMotion,
-        frames: frameIndex
-      });
-    });
-  });
+          finished = true;
+
+          clearTimeout(
+            timeout
+          );
+
+          if (
+            code !== 0
+          ) {
+            reject(
+              new Error(
+                `FFmpeg movement analysis failed with code ${code}: ${stderr}`
+              )
+            );
+
+            return;
+          }
+
+          resolve({
+            rawMotion,
+            frames:
+              frameIndex
+          });
+        }
+      );
+    }
+  );
 }
 
 /* =====================================================
@@ -528,11 +874,14 @@ function buildMotionTimeline(
   rawMotion,
   duration
 ) {
-  if (!rawMotion.length) {
+  if (
+    !rawMotion.length
+  ) {
     return {
       values: [],
+      normalized: [],
       times: [],
-      normalized: []
+      duration
     };
   }
 
@@ -547,9 +896,10 @@ function buildMotionTimeline(
       smoothed
     );
 
-  const times = new Array(
-    normalized.length
-  );
+  const times =
+    new Array(
+      normalized.length
+    );
 
   for (
     let i = 0;
@@ -562,9 +912,13 @@ function buildMotionTimeline(
   }
 
   return {
-    values: smoothed,
+    values:
+      smoothed,
+
     normalized,
+
     times,
+
     duration
   };
 }
@@ -579,7 +933,9 @@ function findMotionPeaks(
 ) {
   const peaks = [];
 
-  if (normalized.length < 3) {
+  if (
+    normalized.length < 3
+  ) {
     return peaks;
   }
 
@@ -605,18 +961,31 @@ function findMotionPeaks(
       current >= next
     ) {
       peaks.push({
-        time: round(times[i], 3),
-        motion: round(current, 4)
+        time:
+          round(
+            times[i],
+            3
+          ),
+
+        motion:
+          round(
+            current,
+            4
+          )
       });
     }
   }
 
   peaks.sort(
     (a, b) =>
-      b.motion - a.motion
+      b.motion -
+      a.motion
   );
 
-  return peaks.slice(0, 50);
+  return peaks.slice(
+    0,
+    50
+  );
 }
 
 /* =====================================================
@@ -637,7 +1006,7 @@ function detectSceneChanges(
     const jump =
       Math.abs(
         normalized[i] -
-        normalized[i - 1]
+          normalized[i - 1]
       );
 
     if (
@@ -645,11 +1014,21 @@ function detectSceneChanges(
       CONFIG.sceneThreshold
     ) {
       changes.push({
-        time: round(times[i], 3),
-        strength: round(
-          clamp(jump, 0, 1),
-          4
-        )
+        time:
+          round(
+            times[i],
+            3
+          ),
+
+        strength:
+          round(
+            clamp(
+              jump,
+              0,
+              1
+            ),
+            4
+          )
       });
     }
   }
@@ -658,51 +1037,127 @@ function detectSceneChanges(
 }
 
 /* =====================================================
-   WINDOW EXTRACTION
+   PREFIX SUM HELPERS
 ===================================================== */
 
-function getWindowValues(
+function buildPrefixSum(
+  values
+) {
+  const prefix =
+    new Float64Array(
+      values.length + 1
+    );
+
+  for (
+    let i = 0;
+    i < values.length;
+    i++
+  ) {
+    prefix[i + 1] =
+      prefix[i] +
+      values[i];
+  }
+
+  return prefix;
+}
+
+function lowerBound(
+  values,
+  target
+) {
+  let low = 0;
+  let high =
+    values.length;
+
+  while (
+    low < high
+  ) {
+    const mid =
+      (low + high) >>
+      1;
+
+    if (
+      values[mid] <
+      target
+    ) {
+      low =
+        mid + 1;
+    } else {
+      high =
+        mid;
+    }
+  }
+
+  return low;
+}
+
+function upperBound(
+  values,
+  target
+) {
+  let low = 0;
+  let high =
+    values.length;
+
+  while (
+    low < high
+  ) {
+    const mid =
+      (low + high) >>
+      1;
+
+    if (
+      values[mid] <=
+      target
+    ) {
+      low =
+        mid + 1;
+    } else {
+      high =
+        mid;
+    }
+  }
+
+  return low;
+}
+
+/* =====================================================
+   WINDOW RANGE
+===================================================== */
+
+function getTimelineRange(
   timeline,
   start,
   end
 ) {
-  const values = [];
+  const times =
+    timeline.times;
 
-  for (
-    let i = 0;
-    i < timeline.times.length;
-    i++
+  if (
+    !times.length
   ) {
-    const time =
-      timeline.times[i];
-
-    if (
-      time >= start &&
-      time < end
-    ) {
-      values.push(
-        timeline.normalized[i]
-      );
-    }
+    return {
+      from: 0,
+      to: 0
+    };
   }
 
-  return values;
-}
+  const from =
+    lowerBound(
+      times,
+      start
+    );
 
-/* =====================================================
-   WINDOW SCENE CHANGES
-===================================================== */
+  const to =
+    lowerBound(
+      times,
+      end
+    );
 
-function getWindowSceneChanges(
-  sceneChanges,
-  start,
-  end
-) {
-  return sceneChanges.filter(
-    change =>
-      change.time >= start &&
-      change.time < end
-  );
+  return {
+    from,
+    to
+  };
 }
 
 /* =====================================================
@@ -714,7 +1169,9 @@ function calculateWindowFeatures(
   sceneChanges,
   duration
 ) {
-  if (!values.length) {
+  if (
+    !values.length
+  ) {
     return {
       averageMotion: 0,
       peakMotion: 0,
@@ -726,7 +1183,9 @@ function calculateWindowFeatures(
       activeTime: 0,
       activePercent: 0,
       motionVariance: 0,
-      motionMedian: 0
+      motionMedian: 0,
+      sceneCount:
+        sceneChanges.length
     };
   }
 
@@ -734,10 +1193,14 @@ function calculateWindowFeatures(
     average(values);
 
   const peakMotion =
-    Math.max(...values);
+    Math.max(
+      ...values
+    );
 
   const minimumMotion =
-    Math.min(...values);
+    Math.min(
+      ...values
+    );
 
   const motionVariance =
     variance(values);
@@ -745,14 +1208,10 @@ function calculateWindowFeatures(
   const motionMedian =
     median(values);
 
-  /*
-  Stability:
-  A good moment should have movement
-  without being completely random/noisy.
-  */
-
   const deviation =
-    standardDeviation(values);
+    Math.sqrt(
+      motionVariance
+    );
 
   const stability =
     clamp(
@@ -767,9 +1226,7 @@ function calculateWindowFeatures(
     );
 
   /*
-  Momentum:
-  How much movement persists
-  across neighboring frames.
+  Momentum
   */
 
   let momentumTotal = 0;
@@ -780,16 +1237,11 @@ function calculateWindowFeatures(
     i < values.length;
     i++
   ) {
-    const previous =
-      values[i - 1];
-
-    const current =
-      values[i];
-
     const persistence =
       1 -
       Math.abs(
-        current - previous
+        values[i] -
+          values[i - 1]
       );
 
     momentumTotal +=
@@ -809,8 +1261,7 @@ function calculateWindowFeatures(
       : 0;
 
   /*
-  Acceleration:
-  movement changing rapidly.
+  Acceleration
   */
 
   let accelerationTotal = 0;
@@ -821,20 +1272,13 @@ function calculateWindowFeatures(
     i < values.length;
     i++
   ) {
-    const a =
+    const firstChange =
+      values[i - 1] -
       values[i - 2];
 
-    const b =
-      values[i - 1];
-
-    const c =
-      values[i];
-
-    const firstChange =
-      b - a;
-
     const secondChange =
-      c - b;
+      values[i] -
+      values[i - 1];
 
     const acceleration =
       Math.abs(
@@ -851,9 +1295,10 @@ function calculateWindowFeatures(
   const acceleration =
     accelerationCount > 0
       ? clamp(
-          accelerationTotal /
-            accelerationCount *
-            3,
+          (
+            accelerationTotal /
+            accelerationCount
+          ) * 3,
           0,
           1
         )
@@ -891,29 +1336,42 @@ function calculateWindowFeatures(
 
   return {
     averageMotion,
+
     peakMotion,
+
     minimumMotion,
+
     stability,
+
     momentum,
+
     acceleration,
+
     density,
+
     activeTime,
+
     activePercent,
+
     motionVariance,
+
     motionMedian,
+
     sceneCount:
       sceneChanges.length
   };
 }
 
 /* =====================================================
-   START / END STRENGTH
+   EDGE STRENGTH
 ===================================================== */
 
 function calculateEdgeStrength(
   values
 ) {
-  if (!values.length) {
+  if (
+    !values.length
+  ) {
     return {
       start: 0,
       end: 0
@@ -924,7 +1382,8 @@ function calculateEdgeStrength(
     Math.max(
       1,
       Math.floor(
-        values.length * 0.12
+        values.length *
+          0.12
       )
     );
 
@@ -942,10 +1401,14 @@ function calculateEdgeStrength(
 
   return {
     start:
-      average(startValues),
+      average(
+        startValues
+      ),
 
     end:
-      average(endValues)
+      average(
+        endValues
+      )
   };
 }
 
@@ -997,19 +1460,24 @@ function scoreMovementWindow(
   */
 
   const averageScore =
-    features.averageMotion * 25;
+    features.averageMotion *
+    25;
 
   const peakScore =
-    features.peakMotion * 20;
+    features.peakMotion *
+    20;
 
   const momentumScore =
-    features.momentum * 15;
+    features.momentum *
+    15;
 
   const densityScore =
-    features.density * 10;
+    features.density *
+    10;
 
   const accelerationScore =
-    features.acceleration * 10;
+    features.acceleration *
+    10;
 
   const sceneScore =
     Math.min(
@@ -1018,13 +1486,16 @@ function scoreMovementWindow(
     ) * 7;
 
   const stabilityScore =
-    features.stability * 5;
+    features.stability *
+    5;
 
   const startScore =
-    edge.start * 4;
+    edge.start *
+    4;
 
   const endScore =
-    edge.end * 4;
+    edge.end *
+    4;
 
   let score =
     averageScore +
@@ -1038,8 +1509,7 @@ function scoreMovementWindow(
     endScore;
 
   /*
-  Prevent totally inactive windows
-  from becoming high-ranked.
+  Penalize very inactive windows.
   */
 
   if (
@@ -1057,12 +1527,14 @@ function scoreMovementWindow(
   }
 
   /*
-  Slight bonus for balanced activity.
+  Balanced activity bonus.
   */
 
   if (
-    features.density >= 0.35 &&
-    features.density <= 0.95
+    features.density >=
+      0.35 &&
+    features.density <=
+      0.95
   ) {
     score += 2;
   }
@@ -1074,90 +1546,115 @@ function scoreMovementWindow(
     );
 
   return {
-    start: round(start, 3),
-    end: round(end, 3),
-    duration: round(
-      duration,
-      3
-    ),
+    start:
+      round(
+        start,
+        3
+      ),
 
-    activeTime: round(
-      features.activeTime,
-      3
-    ),
+    end:
+      round(
+        end,
+        3
+      ),
 
-    activePercent: round(
-      features.activePercent,
-      2
-    ),
+    duration:
+      round(
+        duration,
+        3
+      ),
 
-    averageMotion: round(
-      features.averageMotion,
-      4
-    ),
+    activeTime:
+      round(
+        features.activeTime,
+        3
+      ),
 
-    peakMotion: round(
-      features.peakMotion,
-      4
-    ),
+    activePercent:
+      round(
+        features.activePercent,
+        2
+      ),
 
-    minimumMotion: round(
-      features.minimumMotion,
-      4
-    ),
+    averageMotion:
+      round(
+        features.averageMotion,
+        4
+      ),
 
-    motionMedian: round(
-      features.motionMedian,
-      4
-    ),
+    peakMotion:
+      round(
+        features.peakMotion,
+        4
+      ),
 
-    motionVariance: round(
-      features.motionVariance,
-      5
-    ),
+    minimumMotion:
+      round(
+        features.minimumMotion,
+        4
+      ),
 
-    stability: round(
-      features.stability,
-      4
-    ),
+    motionMedian:
+      round(
+        features.motionMedian,
+        4
+      ),
 
-    momentum: round(
-      features.momentum,
-      4
-    ),
+    motionVariance:
+      round(
+        features.motionVariance,
+        5
+      ),
 
-    acceleration: round(
-      features.acceleration,
-      4
-    ),
+    stability:
+      round(
+        features.stability,
+        4
+      ),
 
-    activityDensity: round(
-      features.density,
-      4
-    ),
+    momentum:
+      round(
+        features.momentum,
+        4
+      ),
+
+    acceleration:
+      round(
+        features.acceleration,
+        4
+      ),
+
+    activityDensity:
+      round(
+        features.density,
+        4
+      ),
 
     sceneChanges:
       features.sceneCount,
 
-    startStrength: round(
-      edge.start,
-      4
-    ),
+    startStrength:
+      round(
+        edge.start,
+        4
+      ),
 
-    endStrength: round(
-      edge.end,
-      4
-    ),
+    endStrength:
+      round(
+        edge.end,
+        4
+      ),
 
-    score: round(
-      score,
-      2
-    )
+    score:
+      round(
+        score,
+        2
+      )
   };
 }
 
 /* =====================================================
-   CREATE 30 SECOND CANDIDATES
+   CREATE MOVEMENT CANDIDATES
 ===================================================== */
 
 function createMovementCandidates(
@@ -1173,18 +1670,25 @@ function createMovementCandidates(
   if (
     duration <= clip
   ) {
-    const values =
-      getWindowValues(
+    const range =
+      getTimelineRange(
         timeline,
         0,
         duration
       );
 
+    const values =
+      timeline.normalized.slice(
+        range.from,
+        range.to
+      );
+
     const scenes =
-      getWindowSceneChanges(
-        sceneChanges,
-        0,
-        duration
+      sceneChanges.filter(
+        change =>
+          change.time >= 0 &&
+          change.time <
+            duration
       );
 
     candidates.push(
@@ -1205,6 +1709,12 @@ function createMovementCandidates(
       duration - clip
     );
 
+  /*
+  Instead of scanning the entire
+  timeline for every window, use
+  binary-search ranges.
+  */
+
   for (
     let start = 0;
     start <= maxStart;
@@ -1217,23 +1727,32 @@ function createMovementCandidates(
         start + clip
       );
 
-    const values =
-      getWindowValues(
+    const range =
+      getTimelineRange(
         timeline,
         start,
         end
       );
 
-    const scenes =
-      getWindowSceneChanges(
-        sceneChanges,
-        start,
-        end
-      );
-
-    if (!values.length) {
+    if (
+      range.to <=
+      range.from
+    ) {
       continue;
     }
+
+    const values =
+      timeline.normalized.slice(
+        range.from,
+        range.to
+      );
+
+    const scenes =
+      sceneChanges.filter(
+        change =>
+          change.time >= start &&
+          change.time < end
+      );
 
     candidates.push(
       scoreMovementWindow(
@@ -1246,7 +1765,7 @@ function createMovementCandidates(
   }
 
   /*
-  Ensure final possible window exists.
+  Guarantee final possible window.
   */
 
   const finalStart =
@@ -1258,30 +1777,43 @@ function createMovementCandidates(
         Math.abs(
           item.start -
             finalStart
-        ) < 0.001
+        ) <
+        0.001
     )
   ) {
     const end =
       Math.min(
         duration,
-        finalStart + clip
+        finalStart +
+          clip
       );
 
-    const values =
-      getWindowValues(
+    const range =
+      getTimelineRange(
         timeline,
         finalStart,
         end
       );
 
-    const scenes =
-      getWindowSceneChanges(
-        sceneChanges,
-        finalStart,
-        end
-      );
+    if (
+      range.to >
+      range.from
+    ) {
+      const values =
+        timeline.normalized.slice(
+          range.from,
+          range.to
+        );
 
-    if (values.length) {
+      const scenes =
+        sceneChanges.filter(
+          change =>
+            change.time >=
+              finalStart &&
+            change.time <
+              end
+        );
+
       candidates.push(
         scoreMovementWindow(
           values,
@@ -1332,7 +1864,9 @@ function getTopSeparated(
           CONFIG.separationSeconds
       );
 
-    if (!tooClose) {
+    if (
+      !tooClose
+    ) {
       selected.push(
         candidate
       );
@@ -1360,7 +1894,9 @@ async function analyzeMovement(
 ) {
   if (
     !videoPath ||
-    !fs.existsSync(videoPath)
+    !fs.existsSync(
+      videoPath
+    )
   ) {
     throw new Error(
       "Video file not found."
@@ -1374,20 +1910,23 @@ async function analyzeMovement(
     );
 
   /*
-  Get duration from ffprobe if
-  caller didn't provide it.
+  If duration is not supplied,
+  get it from FFprobe.
   */
+
+  let videoInfo =
+    null;
 
   if (
     actualDuration <= 0
   ) {
-    const info =
+    videoInfo =
       await getVideoInfo(
         videoPath
       );
 
     actualDuration =
-      info.duration;
+      videoInfo.duration;
   }
 
   if (
@@ -1402,11 +1941,38 @@ async function analyzeMovement(
     typeof progressCallback ===
     "function"
   ) {
+    progressCallback(2);
+  }
+
+  /*
+  Get metadata when possible.
+  */
+
+  if (
+    !videoInfo
+  ) {
+    try {
+      videoInfo =
+        await getVideoInfo(
+          videoPath
+        );
+    } catch {
+      videoInfo =
+        null;
+    }
+  }
+
+  if (
+    typeof progressCallback ===
+    "function"
+  ) {
     progressCallback(3);
   }
 
   /*
-  REAL VIDEO FRAME STREAM
+  =======================================================
+  REAL VIDEO FRAME ANALYSIS
+  =======================================================
   */
 
   const streamResult =
@@ -1417,6 +1983,14 @@ async function analyzeMovement(
     );
 
   if (
+    !streamResult.rawMotion.length
+  ) {
+    throw new Error(
+      "No usable video frames were extracted for movement analysis."
+    );
+  }
+
+  if (
     typeof progressCallback ===
     "function"
   ) {
@@ -1424,7 +1998,9 @@ async function analyzeMovement(
   }
 
   /*
-  Build timeline.
+  =======================================================
+  BUILD TIMELINE
+  =======================================================
   */
 
   const timeline =
@@ -1434,7 +2010,9 @@ async function analyzeMovement(
     );
 
   /*
-  Peaks.
+  =======================================================
+  MOTION PEAKS
+  =======================================================
   */
 
   const motionPeaks =
@@ -1443,8 +2021,17 @@ async function analyzeMovement(
       timeline.times
     );
 
+  if (
+    typeof progressCallback ===
+    "function"
+  ) {
+    progressCallback(97);
+  }
+
   /*
-  Scene changes.
+  =======================================================
+  SCENE CHANGES
+  =======================================================
   */
 
   const sceneChanges =
@@ -1454,7 +2041,9 @@ async function analyzeMovement(
     );
 
   /*
-  Candidates.
+  =======================================================
+  CANDIDATES
+  =======================================================
   */
 
   const candidates =
@@ -1464,8 +2053,17 @@ async function analyzeMovement(
       actualDuration
     );
 
+  if (
+    typeof progressCallback ===
+    "function"
+  ) {
+    progressCallback(98);
+  }
+
   /*
-  Top.
+  =======================================================
+  TOP MOMENTS
+  =======================================================
   */
 
   const top =
@@ -1479,14 +2077,18 @@ async function analyzeMovement(
       : null;
 
   /*
-  Global statistics.
+  =======================================================
+  GLOBAL STATISTICS
+  =======================================================
   */
 
   const normalized =
     timeline.normalized;
 
   const globalAverage =
-    average(normalized);
+    average(
+      normalized
+    );
 
   const globalPeak =
     normalized.length
@@ -1503,10 +2105,14 @@ async function analyzeMovement(
       : 0;
 
   const globalVariance =
-    variance(normalized);
+    variance(
+      normalized
+    );
 
   const globalMedian =
-    median(normalized);
+    median(
+      normalized
+    );
 
   const globalStd =
     standardDeviation(
@@ -1532,9 +2138,15 @@ async function analyzeMovement(
     progressCallback(100);
   }
 
+  /*
+  =======================================================
+  FINAL RESULT
+  =======================================================
+  */
+
   return {
     engine:
-      "Movement Engine MAX V2",
+      "Movement Engine MAX V3",
 
     detector:
       "FFmpeg streaming frame-difference motion analysis",
@@ -1547,6 +2159,20 @@ async function analyzeMovement(
         actualDuration,
         3
       ),
+
+    videoInfo:
+      videoInfo
+        ? {
+            width:
+              videoInfo.width,
+
+            height:
+              videoInfo.height,
+
+            codec:
+              videoInfo.codec
+          }
+        : null,
 
     framesAnalyzed:
       streamResult.frames,
@@ -1644,7 +2270,10 @@ async function analyzeMovement(
         CONFIG.separationSeconds,
 
       memoryMode:
-        "streaming — previous/current frame only"
+        "streaming — previous/current frame only",
+
+      optimization:
+        "prefix/binary-search window indexing"
     }
   };
 }
@@ -1655,13 +2284,22 @@ async function analyzeMovement(
 
 module.exports = {
   analyzeMovement,
+
   getVideoInfo,
+
   calculateFrameMotion,
+
   smoothValues,
+
   normalizeMotion,
+
   findMotionPeaks,
+
   detectSceneChanges,
+
   scoreMovementWindow,
+
   createMovementCandidates,
+
   getTopSeparated
 };
