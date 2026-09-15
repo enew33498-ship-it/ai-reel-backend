@@ -1,1 +1,1033 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
 
+<meta
+  name="viewport"
+  content="width=device-width, initial-scale=1.0"
+>
+
+<title>Movement Engine MAX Test</title>
+
+<style>
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 20px;
+
+  background:
+    radial-gradient(
+      circle at top,
+      #17202b,
+      #05070a 70%
+    );
+
+  color: #ffffff;
+
+  font-family:
+    Arial,
+    Helvetica,
+    sans-serif;
+}
+
+.container {
+  width: 100%;
+  max-width: 900px;
+  margin: auto;
+}
+
+h1 {
+  margin-bottom: 5px;
+
+  font-size: 30px;
+
+  letter-spacing: 1px;
+}
+
+.subtitle {
+  color: #8c9aaa;
+
+  margin-bottom: 25px;
+}
+
+.card {
+  background:
+    rgba(
+      15,
+      20,
+      27,
+      0.92
+    );
+
+  border:
+    1px solid
+    rgba(
+      255,
+      255,
+      255,
+      0.08
+    );
+
+  border-radius: 18px;
+
+  padding: 20px;
+
+  margin-bottom: 18px;
+
+  box-shadow:
+    0 15px 45px
+    rgba(
+      0,
+      0,
+      0,
+      0.35
+    );
+}
+
+input[type="file"] {
+  width: 100%;
+
+  padding: 15px;
+
+  border-radius: 12px;
+
+  border:
+    1px dashed
+    #44515f;
+
+  background:
+    #0a0e13;
+
+  color: white;
+}
+
+button {
+  width: 100%;
+
+  margin-top: 15px;
+
+  padding: 15px;
+
+  border: 0;
+
+  border-radius: 12px;
+
+  background:
+    linear-gradient(
+      135deg,
+      #00e5ff,
+      #0077ff
+    );
+
+  color: white;
+
+  font-size: 16px;
+
+  font-weight: bold;
+
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.4;
+
+  cursor: not-allowed;
+}
+
+.progressOuter {
+  width: 100%;
+
+  height: 14px;
+
+  border-radius: 20px;
+
+  overflow: hidden;
+
+  background:
+    #080b0f;
+
+  margin-top: 15px;
+}
+
+.progressInner {
+  width: 0%;
+
+  height: 100%;
+
+  background:
+    linear-gradient(
+      90deg,
+      #00e5ff,
+      #7c4dff
+    );
+
+  transition:
+    width 0.3s ease;
+}
+
+.status {
+  margin-top: 12px;
+
+  color: #9aa8b7;
+}
+
+.resultTitle {
+  font-size: 20px;
+
+  font-weight: bold;
+
+  margin-bottom: 15px;
+}
+
+.statGrid {
+  display: grid;
+
+  grid-template-columns:
+    repeat(
+      auto-fit,
+      minmax(
+        150px,
+        1fr
+      )
+    );
+
+  gap: 12px;
+
+  margin-top: 15px;
+}
+
+.stat {
+  padding: 15px;
+
+  background:
+    #090d12;
+
+  border-radius: 12px;
+}
+
+.statLabel {
+  color: #7e8b99;
+
+  font-size: 13px;
+
+  margin-bottom: 5px;
+}
+
+.statValue {
+  font-size: 22px;
+
+  font-weight: bold;
+}
+
+.moment {
+  padding: 15px;
+
+  margin-top: 10px;
+
+  background:
+    linear-gradient(
+      135deg,
+      #101821,
+      #090d12
+    );
+
+  border:
+    1px solid
+    rgba(
+      255,
+      255,
+      255,
+      0.07
+    );
+
+  border-radius: 12px;
+}
+
+.moment.best {
+  border:
+    1px solid
+    rgba(
+      0,
+      229,
+      255,
+      0.5
+    );
+}
+
+.momentHeader {
+  display: flex;
+
+  justify-content:
+    space-between;
+
+  gap: 10px;
+
+  flex-wrap: wrap;
+
+  margin-bottom: 10px;
+}
+
+.score {
+  font-size: 20px;
+
+  font-weight: bold;
+
+  color: #00e5ff;
+}
+
+pre {
+  width: 100%;
+
+  overflow-x: auto;
+
+  white-space: pre-wrap;
+
+  word-break: break-word;
+
+  background:
+    #05070a;
+
+  border-radius: 12px;
+
+  padding: 15px;
+
+  color: #b8c7d8;
+
+  font-size: 12px;
+
+  line-height: 1.5;
+}
+
+.hidden {
+  display: none;
+}
+
+</style>
+</head>
+
+<body>
+
+<div class="container">
+
+  <h1>🎬 Movement Engine MAX</h1>
+
+  <div class="subtitle">
+    Real video movement analysis • 30-second moment detection
+  </div>
+
+  <div class="card">
+
+    <input
+      type="file"
+      id="videoInput"
+      accept="video/*"
+    >
+
+    <button
+      id="analyzeBtn"
+    >
+      🚀 START MOVEMENT ANALYSIS
+    </button>
+
+    <div class="progressOuter">
+
+      <div
+        id="progressBar"
+        class="progressInner"
+      ></div>
+
+    </div>
+
+    <div
+      id="status"
+      class="status"
+    >
+      Waiting for video...
+    </div>
+
+  </div>
+
+
+  <div
+    id="resultCard"
+    class="card hidden"
+  >
+
+    <div class="resultTitle">
+      🧠 Movement Analysis Result
+    </div>
+
+    <div
+      id="stats"
+      class="statGrid"
+    ></div>
+
+    <div
+      id="bestMoment"
+    ></div>
+
+    <h3>
+      🏆 Top Movement Moments
+    </h3>
+
+    <div
+      id="topMoments"
+    ></div>
+
+    <h3>
+      🔍 Raw Engine Result
+    </h3>
+
+    <pre
+      id="rawResult"
+    ></pre>
+
+  </div>
+
+</div>
+
+
+<script>
+
+const API_URL =
+  "https://ai-reel-backend-9no6.onrender.com";
+
+const videoInput =
+  document.getElementById(
+    "videoInput"
+  );
+
+const analyzeBtn =
+  document.getElementById(
+    "analyzeBtn"
+  );
+
+const progressBar =
+  document.getElementById(
+    "progressBar"
+  );
+
+const statusBox =
+  document.getElementById(
+    "status"
+  );
+
+const resultCard =
+  document.getElementById(
+    "resultCard"
+  );
+
+const stats =
+  document.getElementById(
+    "stats"
+  );
+
+const bestMoment =
+  document.getElementById(
+    "bestMoment"
+  );
+
+const topMoments =
+  document.getElementById(
+    "topMoments"
+  );
+
+const rawResult =
+  document.getElementById(
+    "rawResult"
+  );
+
+
+/* =====================================================
+   FORMAT TIME
+===================================================== */
+
+function formatTime(seconds) {
+
+  seconds =
+    Math.max(
+      0,
+      Number(seconds) || 0
+    );
+
+  const minutes =
+    Math.floor(
+      seconds / 60
+    );
+
+  const secs =
+    Math.floor(
+      seconds % 60
+    );
+
+  return (
+    String(minutes)
+      .padStart(2, "0")
+    +
+    ":"
+    +
+    String(secs)
+      .padStart(2, "0")
+  );
+}
+
+
+/* =====================================================
+   FORMAT NUMBER
+===================================================== */
+
+function num(
+  value,
+  digits = 2
+) {
+
+  return Number(
+    value || 0
+  ).toFixed(
+    digits
+  );
+}
+
+
+/* =====================================================
+   UPDATE PROGRESS
+===================================================== */
+
+function updateProgress(
+  value
+) {
+
+  value =
+    Math.max(
+      0,
+      Math.min(
+        100,
+        Number(value) || 0
+      )
+    );
+
+  progressBar.style.width =
+    value + "%";
+}
+
+
+/* =====================================================
+   ANALYZE
+===================================================== */
+
+analyzeBtn.onclick =
+  async function() {
+
+  const file =
+    videoInput.files[0];
+
+  if (!file) {
+
+    alert(
+      "Please select a video first."
+    );
+
+    return;
+  }
+
+  analyzeBtn.disabled =
+    true;
+
+  resultCard.classList.add(
+    "hidden"
+  );
+
+  updateProgress(0);
+
+  statusBox.textContent =
+    "Uploading video...";
+
+  try {
+
+    const formData =
+      new FormData();
+
+    formData.append(
+      "video",
+      file
+    );
+
+    const response =
+      await fetch(
+        API_URL +
+        "/movement/analyze",
+        {
+          method:
+            "POST",
+
+          body:
+            formData
+        }
+      );
+
+    const data =
+      await response.json();
+
+    if (!response.ok ||
+        !data.ok) {
+
+      throw new Error(
+        data.error ||
+        "Upload failed."
+      );
+    }
+
+    const jobId =
+      data.jobId;
+
+    statusBox.textContent =
+      "Movement analysis started...";
+
+    await pollJob(
+      jobId
+    );
+
+  } catch (error) {
+
+    console.error(
+      error
+    );
+
+    statusBox.textContent =
+      "❌ " +
+      error.message;
+
+    analyzeBtn.disabled =
+      false;
+  }
+
+};
+
+
+/* =====================================================
+   POLL
+===================================================== */
+
+async function pollJob(
+  jobId
+) {
+
+  while (true) {
+
+    const response =
+      await fetch(
+        API_URL +
+        "/movement/status/" +
+        jobId
+      );
+
+    const data =
+      await response.json();
+
+    if (!response.ok ||
+        !data.ok) {
+
+      throw new Error(
+        data.error ||
+        "Status request failed."
+      );
+    }
+
+    updateProgress(
+      data.progress
+    );
+
+    statusBox.textContent =
+      data.message ||
+      "Analyzing...";
+
+    if (
+      data.status ===
+      "ready"
+    ) {
+
+      statusBox.textContent =
+        "✅ Movement analysis complete.";
+
+      showResult(
+        data.result
+      );
+
+      analyzeBtn.disabled =
+        false;
+
+      return;
+    }
+
+    if (
+      data.status ===
+      "error"
+    ) {
+
+      throw new Error(
+        data.error ||
+        "Movement analysis failed."
+      );
+    }
+
+    await new Promise(
+      resolve =>
+        setTimeout(
+          resolve,
+          1000
+        )
+    );
+  }
+}
+
+
+/* =====================================================
+   SHOW RESULT
+===================================================== */
+
+function showResult(
+  result
+) {
+
+  resultCard.classList.remove(
+    "hidden"
+  );
+
+  if (!result) {
+
+    rawResult.textContent =
+      "No result returned.";
+
+    return;
+  }
+
+
+  /* ===================================================
+     GLOBAL STATS
+  =================================================== */
+
+  const global =
+    result.globalMotion ||
+    {};
+
+  stats.innerHTML = `
+
+    <div class="stat">
+      <div class="statLabel">
+        Engine
+      </div>
+
+      <div class="statValue"
+           style="font-size:15px">
+        ${result.engine || "-"}
+      </div>
+    </div>
+
+    <div class="stat">
+      <div class="statLabel">
+        Video Duration
+      </div>
+
+      <div class="statValue">
+        ${formatTime(
+          result.duration
+        )}
+      </div>
+    </div>
+
+    <div class="stat">
+      <div class="statLabel">
+        Frames Analyzed
+      </div>
+
+      <div class="statValue">
+        ${result.framesAnalyzed || 0}
+      </div>
+    </div>
+
+    <div class="stat">
+      <div class="statLabel">
+        Global Average Motion
+      </div>
+
+      <div class="statValue">
+        ${num(
+          global.average,
+          3
+        )}
+      </div>
+    </div>
+
+    <div class="stat">
+      <div class="statLabel">
+        Global Peak
+      </div>
+
+      <div class="statValue">
+        ${num(
+          global.peak,
+          3
+        )}
+      </div>
+    </div>
+
+    <div class="stat">
+      <div class="statLabel">
+        Scene Changes
+      </div>
+
+      <div class="statValue">
+        ${
+          result.sceneChangeCount ||
+          0
+        }
+      </div>
+    </div>
+
+  `;
+
+
+  /* ===================================================
+     BEST
+  =================================================== */
+
+  const best =
+    result.best;
+
+  if (best) {
+
+    bestMoment.innerHTML = `
+
+      <div class="moment best">
+
+        <div class="momentHeader">
+
+          <strong>
+            🥇 BEST MOVEMENT MOMENT
+          </strong>
+
+          <span class="score">
+            ${num(
+              best.score,
+              2
+            )}/100
+          </span>
+
+        </div>
+
+        <div>
+          ⏱️
+          ${formatTime(
+            best.start
+          )}
+          →
+          ${formatTime(
+            best.end
+          )}
+        </div>
+
+        <br>
+
+        <div>
+          Movement:
+          <strong>
+            ${num(
+              best.averageMotion,
+              3
+            )}
+          </strong>
+        </div>
+
+        <div>
+          Peak:
+          <strong>
+            ${num(
+              best.peakMotion,
+              3
+            )}
+          </strong>
+        </div>
+
+        <div>
+          Activity:
+          <strong>
+            ${num(
+              best.activePercent,
+              1
+            )}%
+          </strong>
+        </div>
+
+        <div>
+          Momentum:
+          <strong>
+            ${num(
+              best.momentum,
+              3
+            )}
+          </strong>
+        </div>
+
+        <div>
+          Acceleration:
+          <strong>
+            ${num(
+              best.acceleration,
+              3
+            )}
+          </strong>
+        </div>
+
+        <div>
+          Scene Changes:
+          <strong>
+            ${
+              best.sceneChanges ||
+              0
+            }
+          </strong>
+        </div>
+
+      </div>
+
+    `;
+
+  } else {
+
+    bestMoment.innerHTML = `
+      <div class="moment">
+        No suitable movement moment found.
+      </div>
+    `;
+
+  }
+
+
+  /* ===================================================
+     TOP MOMENTS
+  =================================================== */
+
+  const top =
+    Array.isArray(
+      result.top
+    )
+      ? result.top
+      : [];
+
+  topMoments.innerHTML =
+    "";
+
+  top.forEach(
+    (moment, index) => {
+
+      const div =
+        document.createElement(
+          "div"
+        );
+
+      div.className =
+        "moment";
+
+      div.innerHTML = `
+
+        <div class="momentHeader">
+
+          <strong>
+            #${index + 1}
+            &nbsp;
+            ${formatTime(
+              moment.start
+            )}
+            →
+            ${formatTime(
+              moment.end
+            )}
+          </strong>
+
+          <span class="score">
+            ${num(
+              moment.score,
+              2
+            )}
+          </span>
+
+        </div>
+
+        <div>
+          Active:
+          ${num(
+            moment.activePercent,
+            1
+          )}%
+        </div>
+
+        <div>
+          Average movement:
+          ${num(
+            moment.averageMotion,
+            3
+          )}
+        </div>
+
+        <div>
+          Peak:
+          ${num(
+            moment.peakMotion,
+            3
+          )}
+        </div>
+
+        <div>
+          Momentum:
+          ${num(
+            moment.momentum,
+            3
+          )}
+        </div>
+
+        <div>
+          Acceleration:
+          ${num(
+            moment.acceleration,
+            3
+          )}
+        </div>
+
+        <div>
+          Scene changes:
+          ${
+            moment.sceneChanges ||
+            0
+          }
+        </div>
+
+      `;
+
+      topMoments.appendChild(
+        div
+      );
+    }
+  );
+
+
+  /* ===================================================
+     RAW
+  =================================================== */
+
+  rawResult.textContent =
+    JSON.stringify(
+      result,
+      null,
+      2
+    );
+}
+
+</script>
+
+</body>
+  </html>
